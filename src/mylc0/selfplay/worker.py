@@ -1,0 +1,435 @@
+"""Self-play workers.
+
+A worker owns one network instance and plays games in a loop, writing one
+gzipped V6 chunk per game. Workers are independent processes writing into
+separate directories, which is what makes it possible to scale self-play out
+later (more processes here, or several machines writing into the same data
+root) without touching the trainer.
+
+The trainer never talks to the workers: they communicate only through the
+files on disk, exactly like a real Lc0 training run.
+"""
+
+from __future__ import annotations
+
+import faulthandler
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+import torch
+
+from ..chessrules.position import BLACK_WON, DRAW, UNDECIDED, WHITE_WON
+from ..net.backend import Backend
+from ..net.config import Config, SelfPlayConfig, load_config
+from ..net.netfile import load_network
+from .batched import BatchedSelfPlay
+
+log = logging.getLogger("mylc0.selfplay")
+
+
+@dataclass
+class WorkerStats:
+    games: int = 0
+    positions: int = 0
+    white_wins: int = 0
+    black_wins: int = 0
+    draws: int = 0
+    adjudicated: int = 0
+    plies: int = 0
+    nodes: int = 0
+    nn_evals: int = 0
+    cache_hits: int = 0
+    seconds: float = 0.0
+
+    def add_game(self, stats) -> None:
+        self.games += 1
+        self.positions += stats.frames
+        self.plies += stats.plies
+        self.nodes += stats.nodes
+        self.nn_evals += stats.nn_evals
+        self.cache_hits += stats.cache_hits
+        self.seconds += stats.seconds
+        if stats.adjudicated:
+            self.adjudicated += 1
+        if stats.result == WHITE_WON:
+            self.white_wins += 1
+        elif stats.result == BLACK_WON:
+            self.black_wins += 1
+        else:
+            self.draws += 1
+
+    def as_dict(self) -> Dict[str, float]:
+        d = dict(self.__dict__)
+        d["avg_game_length"] = self.plies / max(1, self.games)
+        d["games_per_hour"] = self.games / max(1e-9, self.seconds) * 3600
+        d["positions_per_second"] = self.positions / max(1e-9, self.seconds)
+        d["nn_evals_per_second"] = self.nn_evals / max(1e-9, self.seconds)
+        d["nodes_per_move"] = self.nodes / max(1, self.plies)
+        d["nodes_per_second"] = self.nodes / max(1e-9, self.seconds)
+        return d
+
+
+def make_backend(network_path: str, cfg: SelfPlayConfig, device: str,
+                 fp16: bool) -> Backend:
+    model, model_config, metadata = load_network(network_path, device="cpu")
+    backend = Backend(
+        model, model_config,
+        device=device,
+        fp16=fp16,
+        max_batch_size=cfg.batch_size,
+        policy_softmax_temp=cfg.search.policy_softmax_temp,
+        cache_size=cfg.search.nncache_size,
+        # tournament.cc sets CacheHistoryLength to 7 for self-play.
+        cache_history_length=7,
+        history_fill=cfg.search.history_fill)
+    backend.network_metadata = metadata
+    return backend
+
+
+def run_worker(config_path: str, network_path: str, output_dir: str,
+               worker_id: int = 0, num_games: int = 0, seed: int = 0,
+               device: Optional[str] = None, fp16: Optional[bool] = None,
+               log_every: int = 1, stats_path: Optional[str] = None,
+               max_seconds: float = 0.0,
+               target_positions: int = 0,
+               watchdog_seconds: float = 30.0,
+               heartbeat_seconds: float = 10.0) -> Dict[str, float]:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [selfplay-{worker_id}] %(message)s")
+    config: Config = load_config(config_path)
+    cfg = config.selfplay
+    device = device or cfg.device
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    fp16 = cfg.fp16 if fp16 is None else fp16
+
+    # Restored at the end: when a worker runs in-process (loop.py with a
+    # single worker) the trainer still needs autograd afterwards.
+    prev_grad = torch.is_grad_enabled()
+    prev_threads = torch.get_num_threads()
+    torch.set_grad_enabled(False)
+    torch.set_num_threads(1)
+    try:
+        return _play_games(config, cfg, network_path, output_dir, worker_id,
+                           num_games, seed, device, fp16, log_every,
+                           stats_path, max_seconds, target_positions,
+                           watchdog_seconds, heartbeat_seconds)
+    except BaseException:
+        # Never swallow a worker failure: log it here (the parent only sees an
+        # exit code) and re-raise so the exit code is non-zero.
+        log.exception("worker %d died", worker_id)
+        raise
+    finally:
+        torch.set_grad_enabled(prev_grad)
+        torch.set_num_threads(prev_threads)
+
+
+def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
+                seed, device, fp16, log_every, stats_path, max_seconds,
+                target_positions, watchdog_seconds=30.0,
+                heartbeat_seconds=10.0) -> Dict[str, float]:
+    backend = make_backend(network_path, cfg, device, fp16)
+    generation = backend.network_metadata.get("generation", 0)
+    out_dir = os.path.join(output_dir, f"worker_{worker_id:02d}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    parallel = max(1, cfg.parallel_games)
+    if target_positions:
+        # Every game in flight is played to its result, so do not start more
+        # games than the target can absorb: 8 games against a 300-position
+        # target would overshoot by an order of magnitude. Half of
+        # max_game_ply is a conservative guess at a game's length.
+        typical = max(1, cfg.max_game_ply // 2)
+        parallel = max(1, min(parallel, target_positions // typical))
+    driver = BatchedSelfPlay(backend, cfg, parallel, seed=seed)
+    stats = WorkerStats()
+    t_start = time.perf_counter()
+    state = {"index": 0, "last_flush": t_start, "last_progress": t_start,
+             "last_heartbeat": t_start, "signature": None, "stalled": False}
+    log.info("network %s (generation %s), device=%s fp16=%s, visits=%d, "
+             "%d games in flight, max NN batch %d",
+             os.path.basename(network_path), generation, device, fp16,
+             cfg.visits, parallel, cfg.batch_size)
+
+    def on_game(game) -> None:
+        index = state["index"]
+        state["index"] = index + 1
+        name = (f"g{generation:06d}_w{worker_id:02d}_"
+                f"{int(time.time() * 1000):013d}_{index:06d}.gz")
+        frames = game.write(os.path.join(out_dir, name))
+        stats.add_game(game.stats)
+        if log_every and (index + 1) % log_every == 0:
+            result = {WHITE_WON: "1-0", BLACK_WON: "0-1",
+                      DRAW: "1/2-1/2", UNDECIDED: "*"}[game.stats.result]
+            log.info("game %d: %s in %d plies, %d frames, %.1fs "
+                     "| avg NN batch %.0f | W%d D%d B%d",
+                     index + 1, result, game.stats.plies, frames,
+                     game.stats.seconds, driver.avg_batch, stats.white_wins,
+                     stats.draws, stats.black_wins)
+        if stats_path:
+            _write_stats(stats_path, stats, generation,
+                         current_plies=driver.plies_in_flight(),
+                         active=driver.active_games())
+
+    def should_stop() -> bool:
+        if num_games > 0 and stats.games >= num_games:
+            return True
+        # Count the plies already played in the games still running: they will
+        # become training positions once those games finish.
+        if (target_positions
+                and stats.positions + driver.plies_in_flight() >= target_positions):
+            return True
+        if max_seconds and (time.perf_counter() - t_start) > max_seconds:
+            return True
+        return False
+
+    def hard_stop() -> bool:
+        # Only a wall-clock limit abandons games that are already running.
+        return bool(max_seconds
+                    and (time.perf_counter() - t_start) > max_seconds * 1.5)
+
+    def progress_signature():
+        """Everything that must move if self-play is alive."""
+        return (stats.games, stats.positions, driver.plies_in_flight(),
+                backend.evaluations, driver.stats.batches)
+
+    def on_tick() -> None:
+        now = time.perf_counter()
+        if stats_path and now - state["last_flush"] >= 1.0:
+            state["last_flush"] = now
+            _write_stats(stats_path, stats, generation,
+                         current_plies=driver.plies_in_flight(),
+                         active=driver.active_games())
+
+        signature = progress_signature()
+        if signature != state["signature"]:
+            state["signature"] = signature
+            state["last_progress"] = now
+            state["stalled"] = False
+        elif (watchdog_seconds
+              and now - state["last_progress"] >= watchdog_seconds
+              and not state["stalled"]):
+            state["stalled"] = True
+            _dump_diagnostics(worker_id, driver, backend, stats,
+                              now - state["last_progress"])
+
+        if heartbeat_seconds and now - state["last_heartbeat"] >= heartbeat_seconds:
+            elapsed = max(1e-9, now - t_start)
+            log.info("heartbeat: %d games done, %d positions, %d in flight "
+                     "(%d plies) | %.0f nodes/s %.0f evals/s | avg batch %.0f "
+                     "last batch %d | last progress %.1fs ago",
+                     stats.games, stats.positions, driver.active_games(),
+                     driver.plies_in_flight(),
+                     (stats.nodes + driver.nodes_in_flight()) / elapsed,
+                     backend.evaluations / elapsed, driver.avg_batch,
+                     driver.stats.last_batch_size, now - state["last_progress"])
+            state["last_heartbeat"] = now
+
+    driver.run(on_game=on_game, should_stop=should_stop, on_tick=on_tick,
+               hard_stop=hard_stop)
+
+    abandoned = driver.active_games()
+    if abandoned:
+        log.warning("abandoned %d unfinished game(s) with %d plies: a game "
+                    "without a result has no value target and cannot be "
+                    "written. Prefer --target-positions or --games over a "
+                    "wall-clock limit.", abandoned, driver.plies_in_flight())
+
+    if stats_path:
+        _write_stats(stats_path, stats, generation, active=0)
+    log.info("done: %d games, %d positions, %.1f s wall, avg NN batch %.1f "
+             "(min %d, max %d over %d batches)",
+             stats.games, stats.positions, time.perf_counter() - t_start,
+             driver.avg_batch, driver.stats.requests_per_batch_min,
+             driver.stats.requests_per_batch_max, driver.stats.batches)
+    return stats.as_dict()
+
+
+_WARNED = set()
+
+
+def _warn_once(message: str, *args) -> None:
+    if message not in _WARNED:
+        _WARNED.add(message)
+        log.warning(message, *args)
+
+
+def _dump_diagnostics(worker_id, driver, backend, stats, stalled_for) -> None:
+    """Everything needed to tell where self-play got stuck."""
+    now = time.monotonic()
+    since_batch = (now - driver.stats.last_batch_at
+                   if driver.stats.last_batch_at else float("nan"))
+    lines = [
+        "",
+        "=" * 70,
+        f"WATCHDOG: worker {worker_id} (pid {os.getpid()}) made no progress "
+        f"for {stalled_for:.0f}s",
+        "=" * 70,
+        f"  games done            {stats.games}",
+        f"  positions written     {stats.positions}",
+        f"  games in flight       {driver.active_games()} "
+        f"({driver.plies_in_flight()} plies)",
+        f"  NN evaluations        {backend.evaluations}",
+        f"  NN batches            {driver.stats.batches}",
+        f"  last NN batch size    {driver.stats.last_batch_size}",
+        f"  last NN batch         {since_batch:.1f}s ago",
+        f"  NN cache hits         {backend.cache.hits}",
+        f"  draining              {driver.draining}",
+        "  per-game state:",
+    ]
+    lines.extend("    " + line for line in driver.describe())
+    lines.append("=" * 70)
+    log.error("%s", "\n".join(lines))
+    # Where every thread of this process actually is.
+    try:
+        faulthandler.dump_traceback(file=sys.stderr)
+    except Exception:
+        pass
+    sys.stderr.flush()
+
+
+def _write_stats(path: str, stats: WorkerStats, generation,
+                 current_plies: int = 0, active: int = 0) -> None:
+    payload = stats.as_dict()
+    payload["generation"] = generation
+    # Live fields, so a supervisor can show progress inside the current game.
+    payload["current_plies"] = current_plies
+    payload["active"] = active
+    payload["updated"] = time.time()
+    tmp = path + f".{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        # On Windows os.replace fails with "access denied" while another
+        # process has the destination open for reading -- and the supervisor
+        # polls this file twice a second. Retry briefly, then give up: this is
+        # telemetry and must never take a worker down with it.
+        for attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.02 * (attempt + 1))
+        _warn_once("could not update %s (file busy); statistics may lag",
+                   path)
+    except OSError as exc:
+        _warn_once("could not write %s: %s", path, exc)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def read_live_stats(paths: List[str]) -> Dict[str, float]:
+    """Snapshot of the workers' progress, including the games in flight.
+
+    ``positions`` counts finished games only, so ``current_plies`` (the plies
+    played so far in the games currently running) is added to give a smooth
+    number to show while a long game is still being played.
+    """
+    total = aggregate_stats(paths)
+    total["live_positions"] = (total.get("positions", 0)
+                               + total.get("current_plies", 0))
+    return total
+
+
+def monitor_selfplay(stats_paths: List[str], target_positions: int,
+                     progress, stop_event, workers: int = 1,
+                     processes=None, stall_seconds: float = 60.0) -> None:
+    """Render a live self-play progress line until ``stop_event`` is set.
+
+    Also watches the workers: a process that dies is reported immediately
+    (instead of leaving a progress bar spinning on a dead run), and a global
+    lack of progress is flagged.
+    """
+    from ..progress import bar, format_duration, format_eta
+    t0 = time.perf_counter()
+    last_total = -1
+    last_change = t0
+    warned = False
+    reported_dead = set()
+    while True:
+        live = read_live_stats(stats_paths)
+        elapsed = time.perf_counter() - t0
+        done = live.get("live_positions", 0)
+        games = int(live.get("games", 0))
+        active = int(live.get("active", 0))
+        rate = done / elapsed if elapsed > 0 else 0.0
+        parts = ["self-play"]
+        if target_positions > 0:
+            parts.append(f"[{bar(done / target_positions)}] "
+                         f"{done}/{target_positions} pos")
+            if done >= target_positions:
+                # The target is only checked between games, so the games
+                # already in flight are played out -- they cannot be cut off
+                # without losing their result.
+                parts.append("finishing games in flight")
+            else:
+                parts.append(
+                    f"ETA {format_eta(done, target_positions, elapsed)}")
+        else:
+            parts.append(f"{done} pos")
+        parts.append(f"{games} done")
+        # "active" counts games in flight, which is workers x parallel_games
+        # (clamped inside each worker), so it is reported as a count.
+        parts.append(f"{active} in flight")
+        parts.append(f"{rate * 60:.0f} pos/min")
+        parts.append(format_duration(elapsed))
+        progress.set("  ".join(parts))
+
+        if processes:
+            for proc in processes:
+                if (not proc.is_alive() and proc.exitcode
+                        and proc.pid not in reported_dead):
+                    reported_dead.add(proc.pid)
+                    log.error("self-play worker pid %s exited with code %s "
+                              "-- see its traceback above", proc.pid,
+                              proc.exitcode)
+        now = time.perf_counter()
+        if done != last_total:
+            last_total = done
+            last_change = now
+            warned = False
+        elif not warned and now - last_change >= stall_seconds:
+            warned = True
+            log.warning("no self-play progress for %.0fs: %d positions, "
+                        "%d games in flight. Each worker dumps its state "
+                        "after its own watchdog interval.",
+                        now - last_change, done, active)
+
+        if stop_event.wait(0.5):
+            break
+
+
+def aggregate_stats(paths: List[str]) -> Dict[str, float]:
+    total: Dict[str, float] = {}
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for key, value in data.items():
+            if isinstance(value, (int, float)) and key not in (
+                    "avg_game_length", "games_per_hour",
+                    "positions_per_second", "nn_evals_per_second",
+                    "nodes_per_move", "nodes_per_second", "generation",
+                    "updated"):
+                total[key] = total.get(key, 0) + value
+    games = max(1, total.get("games", 0))
+    seconds = max(1e-9, total.get("seconds", 0.0))
+    total["avg_game_length"] = total.get("plies", 0) / games
+    total["games_per_hour"] = total.get("games", 0) / seconds * 3600
+    total["positions_per_second"] = total.get("positions", 0) / seconds
+    total["nodes_per_move"] = total.get("nodes", 0) / max(1, total.get("plies", 0))
+    total["nodes_per_second"] = total.get("nodes", 0) / seconds
+    return total

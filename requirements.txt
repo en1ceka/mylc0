@@ -1,0 +1,7 @@
+# Training and engine.
+torch>=2.1          # install the CUDA build for your system, see README
+numpy>=1.24
+chess>=1.10         # rules only: move generation, FEN, Chess960 castling
+PyYAML>=6.0
+tensorboard>=2.13   # optional, for monitoring
+onnx>=1.15          # optional, only for scripts/export_network.py --onnx

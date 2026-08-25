@@ -1,0 +1,154 @@
+# Same architecture as configs/reference_lc0.yaml -- attention body with
+# smolgen, attention policy head, WDL value head, moves-left head, DeepNorm
+# scaling, identical input planes and identical losses. ONLY the layer sizes
+# differ (upstream Lc0 itself ships networks from ~128x10 up to 1024x15; the
+# size is a configuration field, not an architectural choice).
+#
+# ~10x256 attention body. This is the config to use for an actual from-scratch
+# run on a single consumer GPU.
+
+name: mylc0-small
+
+model:
+  defaults:
+    compute_dtype: f32
+    activation: mish
+    ffn_activation: mish
+  embedding:
+    dense_size: 128
+    embedding_size: 256
+    dff: 384
+  encoder:
+    num_blocks: 10
+    dff: 384
+    d_model: 256
+    heads: 8
+    smolgen:
+      hidden_channels: 32
+      hidden_size: 256
+      gen_size: 256
+      activation: swish
+  policy_head:
+    - name: vanilla
+      embedding_size: 256
+      d_model: 256
+  value_head:
+    - name: winner
+      num_channels: 32
+  movesleft_head:
+    - name: main
+      num_channels: 8
+  # pblczero::NetworkFormat::InputFormat
+  # 5 = INPUT_112_WITH_CANONICALIZATION_V2
+  input_format: 5
+
+training:
+  batch_size: 256
+  gradient_accumulation: 1
+  steps_per_network: 250
+  positions_per_network: 20000
+  max_grad_norm: 10.0
+  mixed_precision: true
+  # Recompute encoder activations during the backward pass. Pure VRAM/compute
+  # trade-off, the network and the maths are untouched: on an RTX 3060 Ti the
+  # reference config at batch 128 goes from 7.2 GB / 425 ms to 2.1 GB / 569 ms.
+  activation_checkpointing: false
+  checkpoint_path: checkpoints
+  checkpoint_max_to_keep: 5
+  networks_path: networks
+  tensorboard_path: runs
+  chunk_pool_size: 6000
+  position_sampling_rate: 0.10
+  shuffle_buffer_size: 65536
+  loader_workers: 2
+  log_every_steps: 10
+  lr_schedule:
+    - starting_step: 0
+      duration_steps: [1500, 500, 0]
+      lr: [0.0, 0.0005, 0.0005]
+      transition: [linear, constant]
+  optimizer:
+    type: nadamw
+    nadamw:
+      beta_1: 0.9
+      beta_2: 0.98
+      epsilon: 1.0e-7
+      weight_decay: 0.0001
+  losses:
+    # Upstream's example lists both a cross-entropy and a KL policy loss on the
+    # same head, each with weight 1.0. They differ only by the (constant)
+    # target entropy, so the gradient is the same and the effective policy
+    # weight is 2.0. Kept as upstream has it; set one weight to 0 for 1:1.
+    policy:
+      - head_name: vanilla
+        metric_name: main_ce
+        weight: 1.0
+        illegal_moves: mask
+        type: cross_entropy
+      - head_name: vanilla
+        metric_name: main_kl
+        weight: 1.0
+        illegal_moves: mask
+        type: kl
+        temperature: 1.0
+    value:
+      - head_name: winner
+        weight: 1.0
+        value_type: result
+    movesleft:
+      - head_name: main
+        weight: 1.0
+        value_type: result
+
+selfplay:
+  visits: 800
+  workers: 1
+  # Games in flight per worker, all feeding one shared network batch.
+  # lc0's selfplay/tournament.cc calls this "parallelism" and defaults to 8.
+  parallel_games: 8
+  output_path: data
+  max_game_ply: 450
+  resign_percentage: 0.0
+  resign_wdl_style: false
+  resign_earliest_move: 0
+  minimum_allowed_visits: 0
+  reuse_tree: false
+  # Upper bound on one network call; implementation limit only,
+  # unlike search.minibatch_size which is part of the algorithm.
+  batch_size: 256
+  device: cuda
+  fp16: true
+  search:
+    # selfplay/tournament.cc training overrides
+    cpuct: 1.2
+    cpuct_at_root: 1.2
+    cpuct_base: 38739.0
+    cpuct_base_at_root: 38739.0
+    cpuct_factor: 0.0
+    cpuct_factor_at_root: 0.0
+    fpu_strategy: reduction
+    fpu_value: 0.0
+    fpu_strategy_at_root: same
+    policy_softmax_temp: 1.0
+    minibatch_size: 32
+    max_collision_visits: 1
+    max_collision_events: 1
+    history_fill: "no"
+    two_fold_draws: false
+    temperature: 1.0
+    temp_decay_moves: 0
+    temp_decay_delay_moves: 0
+    temperature_cutoff_move: 0
+    temperature_endgame: 0.0
+    temperature_winpct_cutoff: 100.0
+    temperature_visit_offset: 0.0
+    noise_epsilon: 0.25
+    noise_alpha: 0.3
+    draw_score: 0.0
+    nncache_size: 200000
+    moves_left_max_effect: 0.0345
+    moves_left_threshold: 0.8
+    moves_left_slope: 0.0027
+    moves_left_constant_factor: 0.0
+    moves_left_scaled_factor: 1.6521
+    moves_left_quadratic_factor: -0.6521
