@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
 checkpoints/
-networks/
+networks/*
+# the tuner and the engine need one real network in a fresh
+# clone; per-generation snapshots stay local
+!networks/latest.mylc0
 data/
 runs/
 stats/
