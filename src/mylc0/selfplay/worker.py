@@ -27,6 +27,7 @@ from ..chessrules.position import BLACK_WON, DRAW, UNDECIDED, WHITE_WON
 from ..net.backend import Backend
 from ..net.config import Config, SelfPlayConfig, load_config
 from ..net.netfile import load_network
+from ..perf import (PerfCounters, affinity_slice, set_affinity, write_json)
 from .batched import BatchedSelfPlay
 
 log = logging.getLogger("mylc0.selfplay")
@@ -98,7 +99,11 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                max_seconds: float = 0.0,
                target_positions: int = 0,
                watchdog_seconds: float = 30.0,
-               heartbeat_seconds: float = 10.0) -> Dict[str, float]:
+               heartbeat_seconds: float = 10.0,
+               perf_debug: bool = False, perf_path: Optional[str] = None,
+               perf_warmup: float = 0.0,
+               torch_threads: int = 1, affinity: bool = False,
+               workers_total: int = 1) -> Dict[str, float]:
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s [selfplay-{worker_id}] %(message)s")
@@ -111,15 +116,25 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
 
     # Restored at the end: when a worker runs in-process (loop.py with a
     # single worker) the trainer still needs autograd afterwards.
+    if affinity:
+        cpus = affinity_slice(worker_id, workers_total)
+        if set_affinity(cpus):
+            log.info("pinned to CPUs %s", cpus)
+        else:
+            log.info("CPU affinity not supported here; running unpinned")
+
     prev_grad = torch.is_grad_enabled()
     prev_threads = torch.get_num_threads()
     torch.set_grad_enabled(False)
-    torch.set_num_threads(1)
+    # One intra-op thread: the search is single-threaded Python and the GPU
+    # does the maths, so a BLAS pool per worker only fights for cores.
+    torch.set_num_threads(max(1, torch_threads))
     try:
         return _play_games(config, cfg, network_path, output_dir, worker_id,
                            num_games, seed, device, fp16, log_every,
                            stats_path, max_seconds, target_positions,
-                           watchdog_seconds, heartbeat_seconds)
+                           watchdog_seconds, heartbeat_seconds, perf_debug,
+                           perf_path, perf_warmup)
     except BaseException:
         # Never swallow a worker failure: log it here (the parent only sees an
         # exit code) and re-raise so the exit code is non-zero.
@@ -133,8 +148,24 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
 def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
                 seed, device, fp16, log_every, stats_path, max_seconds,
                 target_positions, watchdog_seconds=30.0,
-                heartbeat_seconds=10.0) -> Dict[str, float]:
+                heartbeat_seconds=10.0, perf_debug=False,
+                perf_path=None, perf_warmup=0.0) -> Dict[str, float]:
     backend = make_backend(network_path, cfg, device, fp16)
+    perf = None
+    if perf_debug or perf_path:
+        from ..net.backend import BackendTiming
+        from ..search.search import SearchTiming
+        import mylc0.search.search as search_module
+        perf = PerfCounters()
+        backend.timing = BackendTiming()
+        shared_timing = SearchTiming()
+        original_init = search_module.Search.__init__
+
+        def patched_init(self, *a, **kw):
+            original_init(self, *a, **kw)
+            self.timing = shared_timing
+        search_module.Search.__init__ = patched_init
+        perf.search_timing = shared_timing
     generation = backend.network_metadata.get("generation", 0)
     out_dir = os.path.join(output_dir, f"worker_{worker_id:02d}")
     os.makedirs(out_dir, exist_ok=True)
@@ -151,7 +182,9 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
     stats = WorkerStats()
     t_start = time.perf_counter()
     state = {"index": 0, "last_flush": t_start, "last_progress": t_start,
-             "last_heartbeat": t_start, "signature": None, "stalled": False}
+             "last_heartbeat": t_start, "last_perf": t_start,
+             "signature": None, "stalled": False,
+             "warmed": not bool(perf_warmup), "perf_frozen": False}
     log.info("network %s (generation %s), device=%s fp16=%s, visits=%d, "
              "%d games in flight, max NN batch %d",
              os.path.basename(network_path), generation, device, fp16,
@@ -177,7 +210,35 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
                          current_plies=driver.plies_in_flight(),
                          active=driver.active_games())
 
+    def refresh_perf(force=False):
+        if perf is None or (state.get("perf_frozen") and not force):
+            return None
+        perf.absorb_backend(backend.timing)
+        perf.absorb_search(perf.search_timing)
+        perf.cache_hits = backend.cache.hits
+        perf.games = stats.games
+        perf.positions = stats.positions
+        perf.plies = stats.plies + driver.plies_in_flight()
+        perf.nodes = stats.nodes + driver.nodes_in_flight()
+        perf.batch_sizes = driver.batch_history
+        snapshot = perf.snapshot()
+        snapshot["worker_id"] = worker_id
+        snapshot["pid"] = os.getpid()
+        if perf_path:
+            write_json(perf_path, snapshot)
+        return snapshot
+
     def should_stop() -> bool:
+        stop = _should_stop()
+        if stop and perf is not None and not state.get("perf_frozen"):
+            # Freeze the measurement here: everything after this point is the
+            # drain, where games finish one by one and throughput falls off a
+            # cliff. Including it would understate the steady-state rate.
+            refresh_perf(force=True)
+            state["perf_frozen"] = True
+        return stop
+
+    def _should_stop() -> bool:
         if num_games > 0 and stats.games >= num_games:
             return True
         # Count the plies already played in the games still running: they will
@@ -219,6 +280,20 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
             _dump_diagnostics(worker_id, driver, backend, stats,
                               now - state["last_progress"])
 
+        if perf is not None and not state["warmed"] and perf_warmup:
+            if now - t_start >= perf_warmup:
+                # Drop the ramp-up: games start one at a time, CUDA is
+                # cold and the NN cache is empty, all of which skew the
+                # averages downwards.
+                state["warmed"] = True
+                refresh_perf()
+                perf.rebaseline()
+                log.info("perf: measurement window starts now "
+                         "(%.0fs warm-up dropped)", perf_warmup)
+        if perf is not None and now - state["last_perf"] >= 2.0:
+            state["last_perf"] = now
+            refresh_perf()
+
         if heartbeat_seconds and now - state["last_heartbeat"] >= heartbeat_seconds:
             elapsed = max(1e-9, now - t_start)
             log.info("heartbeat: %d games done, %d positions, %d in flight "
@@ -241,6 +316,7 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
                     "written. Prefer --target-positions or --games over a "
                     "wall-clock limit.", abandoned, driver.plies_in_flight())
 
+    refresh_perf()
     if stats_path:
         _write_stats(stats_path, stats, generation, active=0)
     log.info("done: %d games, %d positions, %.1f s wall, avg NN batch %.1f "

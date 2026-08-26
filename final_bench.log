@@ -1,0 +1,127 @@
+Detected hardware
+  GPU              NVIDIA GeForce RTX 3060 Ti 8.6 GB  (CUDA 11.8, torch 2.7.1+cu118)
+  CPU              AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD
+  usable CPUs      16 (logical 16, physical 8)
+  RAM              33.3 GB
+  config           visits=800 minibatch=32 (both fixed, never tuned)
+  network          networks/gen_000033.mylc0
+  trial length     90s
+
+screening skipped: 5 earlier trials read from tune_3060ti.json
+
+==============================================================================
+final benchmark: top 3 configuration(s), 30s warm-up + 300s measured each
+==============================================================================
+  candidate  w4 g16 b256 aff   (screened at 426 pos/min)
+  candidate  w4 g16 b256   (screened at 406 pos/min)
+  candidate  w4 g8 b256   (screened at 331 pos/min)
+
+  running w4 g16 b256 aff ...
+2026-08-26 21:43:10,353 [selfplay-1] pinned to CPUs [4, 5, 6, 7]
+2026-08-26 21:43:10,353 [selfplay-3] pinned to CPUs [12, 13, 14, 15]
+2026-08-26 21:43:10,354 [selfplay-0] pinned to CPUs [0, 1, 2, 3]
+2026-08-26 21:43:10,354 [selfplay-2] pinned to CPUs [8, 9, 10, 11]
+2026-08-26 21:43:10,923 [selfplay-1] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:43:10,961 [selfplay-2] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:43:11,035 [selfplay-3] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:43:11,096 [selfplay-0] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:43:40,971 [selfplay-1] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:43:41,005 [selfplay-2] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:43:41,106 [selfplay-0] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:43:41,118 [selfplay-3] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:51:25,954 [selfplay-1] abandoned 16 unfinished game(s) with 868 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:51:25,955 [selfplay-1] done: 1 games, 28 positions, 495.0 s wall, avg NN batch 103.7 (min 16, max 433 over 6902 batches)
+2026-08-26 21:51:26,063 [selfplay-3] abandoned 14 unfinished game(s) with 667 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:51:26,065 [selfplay-3] done: 3 games, 136 positions, 495.0 s wall, avg NN batch 98.6 (min 16, max 477 over 6545 batches)
+2026-08-26 21:51:26,122 [selfplay-0] abandoned 16 unfinished game(s) with 660 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:51:26,123 [selfplay-0] done: 2 games, 44 positions, 495.0 s wall, avg NN batch 98.9 (min 16, max 439 over 5713 batches)
+2026-08-26 21:51:26,385 [selfplay-2] abandoned 15 unfinished game(s) with 822 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:51:26,386 [selfplay-2] done: 1 games, 32 positions, 495.4 s wall, avg NN batch 95.5 (min 16, max 413 over 7184 batches)
+  w4 g16 b256 aff                  390 pos/min |    3429 evals/s | batch    96 | GPU  94% busy  94% | CPU  61% | waitGPU  55%
+
+  running w4 g16 b256 ...
+2026-08-26 21:51:30,513 [selfplay-3] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:51:30,556 [selfplay-0] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:51:30,573 [selfplay-2] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:51:30,579 [selfplay-1] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 16 games in flight, max NN batch 256
+2026-08-26 21:52:00,567 [selfplay-0] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:52:00,581 [selfplay-3] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:52:00,590 [selfplay-1] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:52:00,598 [selfplay-2] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 21:59:45,537 [selfplay-3] abandoned 14 unfinished game(s) with 743 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:59:45,540 [selfplay-3] done: 3 games, 136 positions, 495.0 s wall, avg NN batch 98.2 (min 16, max 477 over 7189 batches)
+2026-08-26 21:59:45,567 [selfplay-0] abandoned 16 unfinished game(s) with 822 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:59:45,568 [selfplay-0] done: 2 games, 44 positions, 495.0 s wall, avg NN batch 96.5 (min 16, max 439 over 7221 batches)
+2026-08-26 21:59:45,597 [selfplay-2] abandoned 15 unfinished game(s) with 845 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:59:45,598 [selfplay-2] done: 1 games, 32 positions, 495.0 s wall, avg NN batch 96.1 (min 16, max 413 over 7339 batches)
+2026-08-26 21:59:45,627 [selfplay-1] abandoned 16 unfinished game(s) with 861 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 21:59:45,628 [selfplay-1] done: 1 games, 28 positions, 495.1 s wall, avg NN batch 103.6 (min 16, max 433 over 6852 batches)
+  w4 g16 b256                      414 pos/min |    3654 evals/s | batch    95 | GPU  94% busy  94% | CPU  57% | waitGPU  48%
+
+  running w4 g8 b256 ...
+2026-08-26 21:59:49,456 [selfplay-2] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 8 games in flight, max NN batch 256
+2026-08-26 21:59:49,474 [selfplay-1] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 8 games in flight, max NN batch 256
+2026-08-26 21:59:49,478 [selfplay-0] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 8 games in flight, max NN batch 256
+2026-08-26 21:59:49,482 [selfplay-3] network gen_000033.mylc0 (generation 33), device=cuda fp16=True, visits=800, 8 games in flight, max NN batch 256
+2026-08-26 22:00:19,461 [selfplay-2] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 22:00:19,487 [selfplay-0] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 22:00:19,492 [selfplay-1] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 22:00:19,493 [selfplay-3] perf: measurement window starts now (30s warm-up dropped)
+2026-08-26 22:08:04,456 [selfplay-2] abandoned 7 unfinished game(s) with 657 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 22:08:04,457 [selfplay-2] done: 3 games, 325 positions, 495.0 s wall, avg NN batch 61.8 (min 8, max 243 over 12541 batches)
+2026-08-26 22:08:04,477 [selfplay-1] abandoned 4 unfinished game(s) with 244 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 22:08:04,478 [selfplay-1] done: 7 games, 682 positions, 495.0 s wall, avg NN batch 55.4 (min 5, max 242 over 13089 batches)
+2026-08-26 22:08:04,491 [selfplay-3] abandoned 4 unfinished game(s) with 377 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 22:08:04,492 [selfplay-3] done: 5 games, 605 positions, 495.0 s wall, avg NN batch 62.7 (min 4, max 242 over 12175 batches)
+2026-08-26 22:08:04,904 [selfplay-0] abandoned 7 unfinished game(s) with 774 plies: a game without a result has no value target and cannot be written. Prefer --target-positions or --games over a wall-clock limit.
+2026-08-26 22:08:04,905 [selfplay-0] done: 2 games, 168 positions, 495.4 s wall, avg NN batch 56.5 (min 8, max 229 over 13278 batches)
+  w4 g8 b256                       407 pos/min |    3641 evals/s | batch    52 | GPU  85% busy  85% | CPU  46% | waitGPU  57%
+
+==============================================================================
+FINAL BENCHMARK
+==============================================================================
+  configuration               pos/min  nodes/s  evals/s   GPU   CPU   avg   p50   p95  starv  waitGPU
+  ---------------------------------------------------------------------------------------------------
+  w4 g16 b256 aff                 390     5170     3429   94%   61%    96    93   141     6%      55%
+  w4 g16 b256                     414     5495     3654   94%   57%    95    92   139     6%      48%
+  w4 g8 b256                      407     5377     3641   85%   46%    52    50    85    15%      57% <-- winner
+
+  The fastest run was w4 g16 b256 at 414 pos/min, but the winner is within 1.8% (3% tolerance) and uses fewer processes.
+
+Winner
+  workers          4
+  parallel_games   8
+  nn_batch         256
+  precision        fp16
+  CPU affinity     no
+  torch threads    1
+
+Measured over 300s (2033 positions, 7 games finished)
+  positions/min    407
+  nodes/s          5377
+  evals/s          3641
+  avg/p50/p95 batch   52 /  50 /  85
+  GPU util         85%   VRAM 7.1 GB   158 W
+  CPU util         46%
+  GPU starvation   15%
+  CPU wait for GPU 57%
+
+Where a worker's time goes
+  MCTS gather               20.2%
+  terminal / legal moves    12.0%
+  input encoding             7.1%
+  apply + backup             0.8%
+  blocked on GPU            57.2%
+
+WARNING: SMALL NN BATCHES
+  avg batch = 52, max = 165
+  Likely cause: not enough games in flight to fill a batch.
+  Try: raise parallel_games.
+
+Put this in your config:
+  selfplay:
+    parallel_games: 8
+    batch_size: 256
+and run: python scripts/loop.py --workers 4
+
+all trials written to tune_final_3060ti.json

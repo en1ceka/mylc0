@@ -223,6 +223,8 @@ class BatchedSelfPlay:
         # out, because a game without a result cannot be written as training
         # data.
         self.draining = False
+        # Recent batch sizes, for the percentiles in the perf report.
+        self.batch_history: List[int] = []
 
     def step(self) -> int:
         """One collect/evaluate/apply cycle across all games.
@@ -260,6 +262,9 @@ class BatchedSelfPlay:
                 self.stats.requests_per_batch_max, len(requests))
             self.stats.last_batch_size = len(requests)
             self.stats.last_batch_at = time.monotonic()
+            self.batch_history.append(len(requests))
+            if len(self.batch_history) > 20000:
+                del self.batch_history[:10000]
         return len(requests)
 
     def start_draining(self) -> None:
