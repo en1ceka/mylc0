@@ -234,6 +234,10 @@ def generate_shard(args, config_path: str, network_path: str,
             # files. No queue, so nothing here can ever block self-play.
             perf_debug=True, perf_path=perf_paths[i],
             log_level=args.worker_log_level,
+            # The drain is where most of a shard's games actually finish.
+            # Freezing the counters there (which is right for a benchmark)
+            # makes a busy node look hung for minutes.
+            freeze_perf_on_drain=False,
             # A shard boundary is not a quota: whatever the games in flight
             # produce past it goes into the shard. Scaling parallel_games
             # down to fit the target -- which is right for loop.py's exact

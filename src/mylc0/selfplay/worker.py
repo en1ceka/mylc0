@@ -243,7 +243,8 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                workers_total: int = 1,
                scale_parallel_to_target: bool = True,
                runtime_config_path: Optional[str] = None,
-               log_level: str = "INFO") -> Dict[str, float]:
+               log_level: str = "INFO",
+               freeze_perf_on_drain: bool = True) -> Dict[str, float]:
     # A node runs 28 of these. At INFO each one announces itself at startup
     # and the useful output scrolls away, so a supervisor that prints its own
     # aggregate status turns them down to WARNING. Errors and OOM are logged
@@ -279,7 +280,7 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                            stats_path, max_seconds, target_positions,
                            watchdog_seconds, heartbeat_seconds, perf_debug,
                            perf_path, perf_warmup, scale_parallel_to_target,
-                           runtime_config_path)
+                           runtime_config_path, freeze_perf_on_drain)
     except BaseException as exc:
         if _is_cuda_oom(exc):
             # Not a crash: the card is simply too small for this many workers.
@@ -313,7 +314,8 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
                 heartbeat_seconds=10.0, perf_debug=False,
                 perf_path=None, perf_warmup=0.0,
                 scale_parallel_to_target=True,
-                runtime_config_path=None) -> Dict[str, float]:
+                runtime_config_path=None,
+                freeze_perf_on_drain=True) -> Dict[str, float]:
     backend = make_backend(network_path, cfg, device, fp16)
     perf = None
     if perf_debug or perf_path:
@@ -342,7 +344,8 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
     state = {"index": 0, "last_flush": t_start, "last_progress": t_start,
              "last_heartbeat": t_start, "last_perf": t_start,
              "signature": None, "stalled": False,
-             "warmed": not bool(perf_warmup), "perf_frozen": False}
+             "warmed": not bool(perf_warmup), "perf_frozen": False,
+             "drain_logged": False}
     write_runtime_config(runtime_config_path, cfg, parallel, device, fp16,
                          generation)
     scaled = ("" if parallel == cfg.parallel_games else
@@ -383,6 +386,7 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
         perf.positions = stats.positions
         perf.plies = stats.plies + driver.plies_in_flight()
         perf.games_in_flight = driver.active_games()
+        perf.phase = "draining" if driver.draining else "running"
         perf.nodes = stats.nodes + driver.nodes_in_flight()
         perf.batch_sizes = driver.batch_history
         snapshot = perf.snapshot()
@@ -393,13 +397,29 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
         return snapshot
 
     def should_stop() -> bool:
+        """Stop *admitting new games*. Games in flight play on to a result.
+
+        The driver treats this as the start of its drain, not as a stop: a
+        game abandoned mid-way has no result, so no value target, and could
+        not be written even if we wanted it.
+        """
         stop = _should_stop()
         if stop and perf is not None and not state.get("perf_frozen"):
-            # Freeze the measurement here: everything after this point is the
-            # drain, where games finish one by one and throughput falls off a
-            # cliff. Including it would understate the steady-state rate.
-            refresh_perf(force=True)
-            state["perf_frozen"] = True
+            if freeze_perf_on_drain:
+                # A benchmark wants the steady-state rate. The drain has games
+                # finishing one by one and throughput falling off a cliff, so
+                # measuring through it would understate the machine.
+                refresh_perf(force=True)
+                state["perf_frozen"] = True
+            elif not state.get("drain_logged"):
+                # A node wants the opposite: the drain is real work that
+                # produces most of a shard's finished games, and freezing the
+                # counters here makes a busy node look hung -- live positions
+                # stuck, rate zero, games in flight never falling.
+                state["drain_logged"] = True
+                log.info("target reached at %d finished positions; draining "
+                         "%d game(s) still in flight", stats.positions,
+                         driver.active_games())
         return stop
 
     def _should_stop() -> bool:

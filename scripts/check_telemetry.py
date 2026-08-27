@@ -44,7 +44,7 @@ def write_snapshot(path, **fields):
     payload = {"live_plies": 0, "finalized_positions": 0, "games": 0,
                "games_in_flight": 0, "nodes_per_s": 0.0, "evals_per_s": 0.0,
                "avg_batch": 0.0, "p50_batch": 0.0, "p95_batch": 0.0,
-               "cpu_wait_gpu_pct": 0.0}
+               "cpu_wait_gpu_pct": 0.0, "phase": "running"}
     payload.update(fields)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -282,6 +282,180 @@ def check_summary(tmp):
     return "13 fields, JSON serialisable"
 
 
+class _StubBackend:
+    """A deterministic stand-in for the network.
+
+    The lifecycle check below is about the driver, not about the net: games
+    only have to start, take moves and end, and a real forward pass would make
+    this a GPU test for no gain.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.input_format = real.input_format
+        self.movesleft_head = real.movesleft_head
+        self.cache = real.cache
+        # The driver reports on the backend it was given, so the counters it
+        # reads have to exist here too.
+        self.evaluations = 0
+        self.batches = 0
+        self.timing = None
+
+    def encode(self, history):
+        return self._real.encode(history)
+
+    def cache_key(self, history):
+        return self._real.cache_key(history)
+
+    def evaluate(self, requests):
+        import hashlib
+
+        import numpy as np
+        from mylc0.net.backend import EvalResult
+        self.evaluations += len(requests)
+        if requests:
+            self.batches += 1
+        out = []
+        for req in requests:
+            digest = hashlib.blake2b(req.planes.tobytes(),
+                                     digest_size=8).digest()
+            rng = np.random.default_rng(int.from_bytes(digest, "little"))
+            p = rng.random(len(req.policy_indices)).astype(np.float32)
+            p /= p.sum()
+            q = float(rng.random() * 2 - 1)
+            d = float(rng.random() * (1 - abs(q)))
+            out.append(EvalResult(q=q, d=d, m=float(rng.random() * 50), p=p))
+        return out
+
+
+@check("reaching the target drains the games in flight instead of stopping")
+def check_drain_lifecycle(tmp):
+    """The real driver, a stub network, and a target hit halfway through.
+
+    The visits and ply cap below are a test fixture chosen so this finishes in
+    seconds; they are not the training configuration, which this check never
+    loads.
+    """
+    import torch
+    from mylc0.net.backend import Backend
+    from mylc0.net.config import load_config
+    from mylc0.net.model import build_model
+    from mylc0.selfplay.batched import BatchedSelfPlay
+
+    config = load_config("configs/tiny.yaml")
+    cfg = config.selfplay
+    cfg.visits = 8              # fixture: keep the check to a few seconds
+    cfg.max_game_ply = 30
+    cfg.parallel_games = 6
+    torch.manual_seed(11)
+    model = build_model(config.model)
+    real = Backend(model, config.model, device="cpu", fp16=False,
+                   max_batch_size=64)
+    driver = BatchedSelfPlay(_StubBackend(real), cfg, 6, seed=5)
+
+    target_positions = 20
+    trace = []
+    finished = []
+    state = {"draining_seen_at": None}
+
+    def should_stop():
+        # Exactly what the worker does: stop admitting once enough positions
+        # have been *finished*.
+        return sum(g.stats.frames for g in finished) >= target_positions
+
+    def on_game(game):
+        finished.append(game)
+
+    def on_tick():
+        trace.append({
+            "draining": driver.draining,
+            "in_flight": driver.active_games(),
+            "live_plies": sum(g.stats.plies for g in finished)
+            + driver.plies_in_flight(),
+            "finalized": sum(g.stats.frames for g in finished),
+            "done": len(finished),
+        })
+        if driver.draining and state["draining_seen_at"] is None:
+            state["draining_seen_at"] = len(trace) - 1
+
+    driver.run(on_game=on_game, should_stop=should_stop, on_tick=on_tick)
+
+    assert trace, "the driver never ticked"
+    start = state["draining_seen_at"]
+    assert start is not None, "the target was never reached"
+    during = trace[start:]
+    assert len(during) > 1, "the drain finished within a single tick"
+
+    # 1. No new games are started once draining.
+    peak = max(t["in_flight"] for t in trace[:start + 1])
+    for step in during:
+        assert step["in_flight"] <= peak, \
+            f"games in flight rose to {step['in_flight']} during the drain"
+
+    # 2. Live plies keep growing: the machine is still working, and this is
+    #    the number that made a draining node look hung.
+    assert during[-1]["live_plies"] > during[0]["live_plies"], \
+        "live_plies stopped moving during the drain"
+
+    # 3. Finished games keep arriving.
+    assert during[-1]["done"] > during[0]["done"], \
+        "no game finished during the drain"
+    assert during[-1]["finalized"] > during[0]["finalized"]
+
+    # 4. Games in flight fall to zero and the shard closes.
+    assert during[-1]["in_flight"] == 0, during[-1]
+    assert driver.active_games() == 0, "run() returned with games still live"
+
+    # 5. Nothing is clamped to the target: the drain overshoots, and the
+    #    telemetry must report what really happened.
+    final = sum(g.stats.frames for g in finished)
+    assert final >= target_positions, (final, target_positions)
+    assert during[-1]["live_plies"] >= final
+
+    # 6. Every finished game has a result; an abandoned one could not be
+    #    written and must never appear here.
+    for game in finished:
+        assert game.stats.result is not None
+
+    return (f"drained {peak} -> 0 in flight over {len(during)} ticks, "
+            f"{len(finished)} games, {final} positions for a target of "
+            f"{target_positions}")
+
+
+@check("a draining node reports DRAINING, not 100% with no ETA")
+def check_draining_line(tmp):
+    paths = make_node(os.path.join(tmp, "drain"), 4)
+    for path in paths:
+        write_snapshot(path, live_plies=2500, finalized_positions=1200,
+                       games=30, games_in_flight=48, phase="running")
+    status = NodeStatus(paths, target_positions=10000)
+    status.sample(now=1000.0)
+    running = status.line(36, "7a52425f", 1)
+    assert "DRAINING" not in running, running
+    assert "shard " in running and "ETA" in running, running
+
+    # The target is met; every worker switches to draining and games start
+    # coming home.
+    for path in paths:
+        write_snapshot(path, live_plies=9000, finalized_positions=2600,
+                       games=64, games_in_flight=30, phase="draining")
+    r = status.sample(now=1015.0)
+    assert r["draining"] is True, r
+    line = status.line(36, "7a52425f", 1)
+    assert "DRAINING" in line, line
+    assert "target reached" in line, line
+    assert "192 -> 120 in flight" in line, line     # peak 4x48 -> 4x30
+    assert "ETA" not in line, "an ETA was shown for a drain"
+    assert r["eta_s"] != r["eta_s"], "a drain ETA was computed"
+
+    # One worker still admitting games means the shard is not draining yet.
+    write_snapshot(paths[0], live_plies=9000, finalized_positions=2600,
+                   games=64, games_in_flight=48, phase="running")
+    mixed = status.sample(now=1030.0)
+    assert mixed["draining"] is False, "called it draining too early"
+    return "running shows progress, draining shows peak -> in flight"
+
+
 def main() -> int:
     argparse.ArgumentParser(description=__doc__).parse_args()
     tmp = tempfile.mkdtemp(prefix="mylc0-telemetry-")
@@ -295,6 +469,10 @@ def main() -> int:
         check_no_division_by_zero(tmp)
         check_eta(tmp)
         check_live_before_finished(tmp)
+
+        print("\n== shard lifecycle ==")
+        check_drain_lifecycle(tmp)
+        check_draining_line(tmp)
 
         print("\n== log levels ==")
         check_log_level(tmp)

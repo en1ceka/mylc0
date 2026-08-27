@@ -80,6 +80,7 @@ class NodeStatus:
         self._cpu: List[float] = []
         self._vram: List[float] = []
         self.last: Dict[str, float] = {}
+        self._peak_in_flight = 0.0
 
     # -- collection --------------------------------------------------------
     def read_workers(self) -> List[Dict[str, float]]:
@@ -147,6 +148,13 @@ class NodeStatus:
             self._vram.append(memory["used_mib"])
 
         gpu_busy = float(gpu["utilization.gpu"]) if gpu else float("nan")
+        # A shard is draining once every worker has stopped admitting games.
+        # While even one is still starting them the shard is still filling.
+        phases = [str(w.get("phase", "running")) for w in workers]
+        draining = bool(phases) and all(p == "draining" for p in phases)
+        peak_in_flight = max(self._peak_in_flight,
+                             total("games_in_flight"))
+        self._peak_in_flight = peak_in_flight
         reading = {
             "workers_reporting": len(workers),
             "live_plies": live_plies,
@@ -168,10 +176,17 @@ class NodeStatus:
             "vram_used_mib": memory["used_mib"] if memory else float("nan"),
             "vram_total_mib": memory["total_mib"] if memory else float("nan"),
             "elapsed_s": now - self.started,
+            "draining": draining,
+            "draining_workers": sum(1 for p in phases if p == "draining"),
+            "peak_games_in_flight": peak_in_flight,
         }
-        reading["progress"] = (live_plies / self.target_positions
+        # Progress is measured against finished positions, which is what the
+        # target actually gates on -- live plies include games in flight and
+        # would read past 100% long before the shard could close.
+        reading["progress"] = (finalized / self.target_positions
                                if self.target_positions else 0.0)
-        reading["eta_s"] = self.eta(live_plies, rate_per_min)
+        reading["eta_s"] = (float("nan") if draining
+                            else self.eta(finalized, rate_per_min))
         self.last = reading
         return reading
 
@@ -203,10 +218,20 @@ class NodeStatus:
                else f"{r['gpu_util']:.0f}%")
         cpu = ("?" if r["cpu_util"] != r["cpu_util"]
                else f"{r['cpu_util']:.0f}%")
-        progress = (f" | shard {100 * r['progress']:.0f}%"
-                    if self.target_positions else "")
-        eta = (f" | ETA {_fmt_duration(r['eta_s'])}"
-               if self.target_positions else "")
+        if r.get("draining"):
+            # Percent and ETA are both meaningless here: the target is met and
+            # what remains is however long the games in flight take. Saying
+            # "100% | ETA ?" every heartbeat looks like a hang, which is
+            # exactly what this state is not.
+            progress = (f" | DRAINING target reached | peak "
+                        f"{r['peak_games_in_flight']:.0f} -> "
+                        f"{r['games_in_flight']:.0f} in flight")
+            eta = ""
+        else:
+            progress = (f" | shard {100 * r['progress']:.0f}%"
+                        if self.target_positions else "")
+            eta = (f" | ETA {_fmt_duration(r['eta_s'])}"
+                   if self.target_positions else "")
         rate = ("--" if r["positions_per_min"] != r["positions_per_min"]
                 else f"{r['positions_per_min']:.0f}")
         return (
@@ -254,6 +279,7 @@ class NodeStatus:
             "cpu_util_avg": round(_mean(self._cpu), 1),
             "cpu_wait_gpu_pct": round(r["cpu_wait_gpu_pct"], 1),
             "vram_peak_mib": round(max(self._vram), 1) if self._vram else None,
+            "peak_games_in_flight": int(r.get("peak_games_in_flight", 0)),
             "vram_total_mib": (round(r["vram_total_mib"], 1)
                                if r["vram_total_mib"] == r["vram_total_mib"]
                                else None),

@@ -315,6 +315,7 @@ class PerfCounters:
     _base_batches: int = 0
 
     games_in_flight: int = 0
+    phase: str = "running"
 
     def rebaseline(self) -> None:
         """Start a fresh measurement window at the current totals."""
@@ -398,6 +399,7 @@ class PerfCounters:
             "live_plies": self._since("plies"),
             "finalized_positions": self._since("positions"),
             "games_in_flight": self.games_in_flight,
+            "phase": self.phase,
         }
 
 
