@@ -174,6 +174,61 @@ def _write_failure(path: Optional[str], kind: str, detail: str) -> None:
         pass
 
 
+def effective_parallel_games(cfg, target_positions: int,
+                             scale_to_target: bool = True) -> int:
+    """How many games this worker actually keeps in flight.
+
+    Every game in flight is played to its result, so a worker asked for a
+    small, exact number of positions should not start more games than that
+    number can absorb: 8 games against a 300-position target overshoots by an
+    order of magnitude. ``loop.py`` wants that behaviour -- it asks for a
+    precise quota per generation.
+
+    A self-play node does not. Its target is a *shard boundary*, not a quota:
+    whatever the games in flight produce past it simply goes into the shard.
+    Scaling down there is actively harmful -- 28 workers x 48 games against a
+    2000-position shard target collapses to one game each, which drops the NN
+    batch from ~318 to ~10 and costs roughly 6x throughput. Such callers pass
+    ``scale_to_target=False`` and stop starting new games instead.
+    """
+    parallel = max(1, cfg.parallel_games)
+    if not (scale_to_target and target_positions):
+        return parallel
+    # Half of max_game_ply is a conservative guess at a game's length.
+    typical = max(1, cfg.max_game_ply // 2)
+    return max(1, min(parallel, target_positions // typical))
+
+
+def write_runtime_config(path, cfg, parallel: int, device: str, fp16: bool,
+                         generation) -> None:
+    """Publish what this worker is *actually* running with.
+
+    The knobs travel through a config file and a process boundary, and a
+    mismatch is invisible in the output -- it just produces correct games
+    slowly. A supervisor reads this back and refuses to keep going if what
+    arrived is not what it asked for.
+    """
+    if not path:
+        return
+    payload = {"parallel_games": parallel,
+               "requested_parallel_games": cfg.parallel_games,
+               "nn_batch": cfg.batch_size,
+               "fp16": bool(fp16),
+               "visits": cfg.visits,
+               "minibatch_size": cfg.search.minibatch_size,
+               "device": str(device),
+               "generation": generation,
+               "pid": os.getpid()}
+    tmp = path + f".{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        pass                    # telemetry must never take a worker down
+
+
 def run_worker(config_path: str, network_path: str, output_dir: str,
                worker_id: int = 0, num_games: int = 0, seed: int = 0,
                device: Optional[str] = None, fp16: Optional[bool] = None,
@@ -185,7 +240,9 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                perf_debug: bool = False, perf_path: Optional[str] = None,
                perf_warmup: float = 0.0,
                torch_threads: int = 1, affinity: bool = False,
-               workers_total: int = 1) -> Dict[str, float]:
+               workers_total: int = 1,
+               scale_parallel_to_target: bool = True,
+               runtime_config_path: Optional[str] = None) -> Dict[str, float]:
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s [selfplay-{worker_id}] %(message)s")
@@ -216,7 +273,8 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                            num_games, seed, device, fp16, log_every,
                            stats_path, max_seconds, target_positions,
                            watchdog_seconds, heartbeat_seconds, perf_debug,
-                           perf_path, perf_warmup)
+                           perf_path, perf_warmup, scale_parallel_to_target,
+                           runtime_config_path)
     except BaseException as exc:
         if _is_cuda_oom(exc):
             # Not a crash: the card is simply too small for this many workers.
@@ -248,7 +306,9 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
                 seed, device, fp16, log_every, stats_path, max_seconds,
                 target_positions, watchdog_seconds=30.0,
                 heartbeat_seconds=10.0, perf_debug=False,
-                perf_path=None, perf_warmup=0.0) -> Dict[str, float]:
+                perf_path=None, perf_warmup=0.0,
+                scale_parallel_to_target=True,
+                runtime_config_path=None) -> Dict[str, float]:
     backend = make_backend(network_path, cfg, device, fp16)
     perf = None
     if perf_debug or perf_path:
@@ -269,14 +329,8 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
     out_dir = os.path.join(output_dir, f"worker_{worker_id:02d}")
     os.makedirs(out_dir, exist_ok=True)
 
-    parallel = max(1, cfg.parallel_games)
-    if target_positions:
-        # Every game in flight is played to its result, so do not start more
-        # games than the target can absorb: 8 games against a 300-position
-        # target would overshoot by an order of magnitude. Half of
-        # max_game_ply is a conservative guess at a game's length.
-        typical = max(1, cfg.max_game_ply // 2)
-        parallel = max(1, min(parallel, target_positions // typical))
+    parallel = effective_parallel_games(cfg, target_positions,
+                                        scale_parallel_to_target)
     driver = BatchedSelfPlay(backend, cfg, parallel, seed=seed)
     stats = WorkerStats()
     t_start = time.perf_counter()
@@ -284,10 +338,15 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
              "last_heartbeat": t_start, "last_perf": t_start,
              "signature": None, "stalled": False,
              "warmed": not bool(perf_warmup), "perf_frozen": False}
+    write_runtime_config(runtime_config_path, cfg, parallel, device, fp16,
+                         generation)
+    scaled = ("" if parallel == cfg.parallel_games else
+              f" (scaled down from {cfg.parallel_games} to fit a "
+              f"{target_positions}-position target)")
     log.info("network %s (generation %s), device=%s fp16=%s, visits=%d, "
-             "%d games in flight, max NN batch %d",
+             "%d games in flight%s, max NN batch %d",
              os.path.basename(network_path), generation, device, fp16,
-             cfg.visits, parallel, cfg.batch_size)
+             cfg.visits, parallel, scaled, cfg.batch_size)
 
     def on_game(game) -> None:
         index = state["index"]

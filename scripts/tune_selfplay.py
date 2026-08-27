@@ -357,16 +357,27 @@ def _verify_cleanup(base_vram, survivors, pids, settle_seconds):
 
 
 def _dump_config(source, target, parallel_games, nn_batch):
-    """Copy the config with only the two implementation knobs overridden."""
+    """Copy the config, overriding the two knobs, only under ``selfplay:``.
+
+    ``batch_size`` appears twice in the reference configs -- once under
+    ``training:`` and once under ``selfplay:`` -- at the same indentation, so
+    matching on the key alone silently rewrites the trainer's batch size too.
+    Tracking the current top-level section keeps the override where it was
+    aimed.
+    """
     with open(source, encoding="utf-8") as f:
         text = f.read()
     out = []
+    section = None
     for line in text.splitlines():
+        if line[:1] not in (" ", "	", "#", ""):
+            section = line.split(":", 1)[0].strip()
         stripped = line.strip()
-        if stripped.startswith("parallel_games:"):
-            line = f"  parallel_games: {parallel_games}"
-        elif stripped.startswith("batch_size:") and line.startswith("  batch_size:"):
-            line = f"  batch_size: {nn_batch}"
+        if section == "selfplay":
+            if stripped.startswith("parallel_games:"):
+                line = f"  parallel_games: {parallel_games}"
+            elif stripped.startswith("batch_size:"):
+                line = f"  batch_size: {nn_batch}"
         out.append(line)
     with open(target, "w", encoding="utf-8") as f:
         f.write("\n".join(out))

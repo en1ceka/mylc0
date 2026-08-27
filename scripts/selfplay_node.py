@@ -79,25 +79,102 @@ def _install_signal_handlers() -> None:
 
 def _dump_config(source: str, target: str, parallel_games: int,
                  nn_batch: int) -> None:
-    """Copy the config with only the two implementation knobs overridden."""
+    """Copy the config, overriding only the two knobs, only under selfplay:.
+
+    ``batch_size`` appears twice in the reference configs -- once under
+    ``training:`` and once under ``selfplay:`` -- at the same indentation, so
+    matching on the key alone silently rewrites the trainer's batch size too.
+    Tracking which top-level section a line belongs to is what keeps the
+    override where it was aimed.
+    """
     with open(source, encoding="utf-8") as handle:
         text = handle.read()
     out = []
+    section = None
     for line in text.splitlines():
+        if line[:1] not in (" ", "\t", "#", ""):
+            section = line.split(":", 1)[0].strip()
         stripped = line.strip()
-        if parallel_games and stripped.startswith("parallel_games:"):
-            line = f"  parallel_games: {parallel_games}"
-        elif (nn_batch and stripped.startswith("batch_size:")
-              and line.startswith("  batch_size:")):
-            line = f"  batch_size: {nn_batch}"
+        if section == "selfplay":
+            if parallel_games and stripped.startswith("parallel_games:"):
+                line = f"  parallel_games: {parallel_games}"
+            elif nn_batch and stripped.startswith("batch_size:"):
+                line = f"  batch_size: {nn_batch}"
         out.append(line)
     with open(target, "w", encoding="utf-8") as handle:
         handle.write("\n".join(out) + "\n")
 
+class ConfigMismatch(RuntimeError):
+    """A worker started with knobs the node did not ask for."""
+
+
+def verify_runtime_config(paths, expected, timeout=180.0, alive=None):
+    """Read back what each worker actually started with, and insist it match.
+
+    The knobs travel through a YAML file, a process boundary and a driver
+    constructor. A mismatch anywhere in that chain still produces correct
+    games -- just far fewer of them -- so it is invisible in the output and
+    shows up only as a throughput number nobody is watching. Checking costs
+    one small file per worker and turns a silent 6x slowdown into a startup
+    error.
+    """
+    deadline = time.time() + timeout
+    seen = {}
+    while time.time() < deadline:
+        for index, path in enumerate(paths):
+            if index in seen:
+                continue
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    seen[index] = json.load(handle)
+            except (OSError, ValueError):
+                continue
+        if len(seen) == len(paths):
+            break
+        if alive is not None and not alive():
+            break
+        time.sleep(0.25)
+
+    if not seen:
+        raise ConfigMismatch(
+            "no worker reported its runtime configuration within "
+            f"{timeout:.0f}s; self-play did not start")
+
+    problems = []
+    for index, actual in sorted(seen.items()):
+        for key, want in expected.items():
+            got = actual.get(key)
+            if got != want:
+                problems.append(f"worker {index}: {key} is {got!r}, "
+                                f"expected {want!r}")
+    missing = [i for i in range(len(paths)) if i not in seen]
+    if missing and not problems:
+        log.warning("worker(s) %s did not report a runtime config", missing)
+    if problems:
+        raise ConfigMismatch(
+            "workers did not start with the requested configuration:\n  "
+            + "\n  ".join(problems[:10])
+            + ("\n  ..." if len(problems) > 10 else ""))
+    return seen
+
+
+def overshoot_floor(workers, parallel_games, max_game_ply):
+    """Positions below which a shard target cannot be honoured at all.
+
+    Every game in flight plays to its result, so the smallest shard a node can
+    produce is roughly one full round of games across every worker. Asking for
+    less does not make a smaller shard -- it makes the same shard while the
+    target fires immediately.
+    """
+    return workers * parallel_games * max(1, max_game_ply // 2)
+
 
 def generate_shard(args, config_path: str, network_path: str,
-                   staging_dir: str, target_positions: int):
-    """Run one round of self-play into ``staging_dir``. Returns totals."""
+                   staging_dir: str, target_positions: int, expected: dict):
+    """Run one round of self-play into ``staging_dir``. Returns totals.
+
+    Raises ConfigMismatch if the workers did not start with ``expected``.
+    """
     shutil.rmtree(staging_dir, ignore_errors=True)
     os.makedirs(staging_dir, exist_ok=True)
     stats_dir = os.path.join(staging_dir, "_stats")
@@ -107,6 +184,8 @@ def generate_shard(args, config_path: str, network_path: str,
     per_worker = max(1, math.ceil(target_positions / workers))
     stats_paths = [os.path.join(stats_dir, f"stats_{i}.json")
                    for i in range(workers)]
+    runtime_paths = [os.path.join(stats_dir, f"runtime_{i}.json")
+                     for i in range(workers)]
 
     ctx = mp.get_context("spawn")
     procs = []
@@ -119,11 +198,33 @@ def generate_shard(args, config_path: str, network_path: str,
             device=args.device, num_games=0,
             target_positions=per_worker, log_every=0,
             stats_path=stats_paths[i],
+            runtime_config_path=runtime_paths[i],
+            # A shard boundary is not a quota: whatever the games in flight
+            # produce past it goes into the shard. Scaling parallel_games
+            # down to fit the target -- which is right for loop.py's exact
+            # per-generation quota -- would collapse 48 games to 1 here.
+            scale_parallel_to_target=False,
             watchdog_seconds=args.watchdog_seconds,
             heartbeat_seconds=0, torch_threads=args.torch_threads,
             affinity=args.affinity, workers_total=workers))
         proc.start()
         procs.append(proc)
+
+    try:
+        observed = verify_runtime_config(
+            runtime_paths, expected,
+            alive=lambda: any(p.is_alive() for p in procs))
+    except ConfigMismatch:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in procs:
+            proc.join(5.0)
+        raise
+    first = observed[min(observed)]
+    log.info("workers confirmed: %d games in flight, NN batch %d, fp16=%s, "
+             "visits=%d", first["parallel_games"], first["nn_batch"],
+             first["fp16"], first["visits"])
 
     for proc in procs:
         proc.join()
@@ -251,6 +352,19 @@ def main() -> int:
           if not args.shard_games else
           f"  shard target     {args.shard_games} games")
     print(f"  cache            {cache_dir}")
+    floor = overshoot_floor(args.workers, effective.selfplay.parallel_games,
+                            effective.selfplay.max_game_ply)
+    if not args.shard_games and args.shard_positions < floor:
+        print(f"\n  NOTE: --shard-positions {args.shard_positions} is below "
+              f"{floor}, which is one full\n"
+              f"        round of {args.workers} workers x "
+              f"{effective.selfplay.parallel_games} games x ~"
+              f"{effective.selfplay.max_game_ply // 2} plies. Every game in "
+              f"flight plays to its\n"
+              f"        result, so the shard will be roughly that size "
+              f"regardless. For a short\n"
+              f"        test use fewer workers and games, not a smaller "
+              f"target.")
     print(f"  backlog limit    {args.max_backlog_gb:.1f} GB, "
           f"keep local: {args.keep_local_shards}")
     print("R2 configuration")
@@ -274,6 +388,14 @@ def main() -> int:
     if args.dry_run:
         print("dry run: R2 reachable, model verified, nothing generated")
         return 0
+
+    expected_runtime = {
+        "parallel_games": effective.selfplay.parallel_games,
+        "nn_batch": effective.selfplay.batch_size,
+        "visits": effective.selfplay.visits,
+        "minibatch_size": effective.selfplay.search.minibatch_size,
+        "fp16": bool(effective.selfplay.fp16),
+    }
 
     uploader = ShardUploader(store, outbox, attempts=args.retry_attempts,
                              base_delay=args.retry_backoff,
@@ -314,8 +436,14 @@ def main() -> int:
             target_positions = args.shard_games * max(
                 1, effective.selfplay.max_game_ply // 2)
 
-        totals = generate_shard(args, run_config, network_path, staging,
-                                target_positions)
+        try:
+            totals = generate_shard(args, run_config, network_path, staging,
+                                    target_positions, expected_runtime)
+        except ConfigMismatch as exc:
+            log.error("%s", exc)
+            log.error("Refusing to generate slow data. This is a "
+                      "configuration bug, not a transient failure.")
+            return 5
         if totals["failed"]:
             log.error("worker(s) exited with %s", totals["failed"])
 
