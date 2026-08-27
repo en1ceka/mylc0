@@ -10,3 +10,6 @@ runs/
 stats/
 smoke/
 *.onnx
+
+# R2 credentials: never committed.
+.env
