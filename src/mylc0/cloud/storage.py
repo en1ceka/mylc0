@@ -356,6 +356,54 @@ ENV_VARS = ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
             "R2_BUCKET", "R2_REGION")
 
 
+def _project_root() -> str:
+    # src/mylc0/cloud/storage.py -> the repo root
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(here, os.pardir, os.pardir, os.pardir))
+
+
+def load_env_file(path: Optional[str] = None) -> int:
+    """Read ``.env`` into the environment. Returns how many names it set.
+
+    Sourcing a file is shell-specific -- ``set -a && . ./.env`` in bash does
+    nothing in PowerShell -- and this project runs the trainer on Windows and
+    the nodes on Linux. Reading the file here means one instruction works
+    everywhere.
+
+    Variables already present in the environment always win, so an explicit
+    ``export`` on a node still overrides the file, and nothing is printed:
+    the file holds secrets.
+    """
+    candidates = [path] if path else [
+        os.environ.get("MYLC0_ENV_FILE"),
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(_project_root(), ".env"),
+    ]
+    for candidate in candidates:
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        applied = 0
+        try:
+            with open(candidate, encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.lower().startswith("export "):
+                line = line[7:]
+            name, _sep, value = line.partition("=")
+            name = name.strip()
+            value = value.strip().strip('"').strip("'")
+            if name and value and not os.environ.get(name):
+                os.environ[name] = value
+                applied += 1
+        return applied
+    return 0
+
+
 def store_from_env(**overrides) -> ObjectStore:
     """Build an S3Store from R2_* environment variables.
 
@@ -365,12 +413,20 @@ def store_from_env(**overrides) -> ObjectStore:
     def pick(name, default=""):
         return overrides.get(name.lower()) or os.environ.get(name, default)
 
+    if any(not pick(n) for n in ENV_VARS[:4]):
+        load_env_file()
+
     missing = [n for n in ENV_VARS[:4] if not pick(n)]
     if missing:
         raise StorageError(
             "missing R2 configuration: " + ", ".join(missing)
-            + "\nSet them in the environment, for example:\n"
-            + "\n".join(f"  export {n}=..." for n in missing))
+            + "\n\nEasiest fix: put them in a .env file in the project root "
+              "(see .env.example);\nit is gitignored and every script reads "
+              "it automatically.\n\nOr set them in the shell:\n"
+            + "  PowerShell:  "
+            + "; ".join(f'$env:{n}="..."' for n in missing)
+            + "\n  bash:        "
+            + " ".join(f"export {n}=..." for n in missing))
     return S3Store(bucket=pick("R2_BUCKET"),
                    endpoint_url=pick("R2_ENDPOINT_URL"),
                    access_key=pick("R2_ACCESS_KEY_ID"),
@@ -380,6 +436,7 @@ def store_from_env(**overrides) -> ObjectStore:
 
 def describe_env() -> str:
     """What is configured, with the secrets reduced to a length."""
+    load_env_file()
     lines = []
     for name in ENV_VARS:
         value = os.environ.get(name)
@@ -394,4 +451,5 @@ def describe_env() -> str:
 
 __all__ = ["ObjectStore", "S3Store", "MemoryStore", "ObjectInfo",
            "StorageError", "NotFound", "with_retries", "store_from_env",
+           "load_env_file",
            "describe_env", "sha256_file", "sha256_bytes", "ENV_VARS"]
