@@ -244,7 +244,9 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                scale_parallel_to_target: bool = True,
                runtime_config_path: Optional[str] = None,
                log_level: str = "INFO",
-               freeze_perf_on_drain: bool = True) -> Dict[str, float]:
+               freeze_perf_on_drain: bool = True,
+               stop_file: Optional[str] = None,
+               chunk_dir: Optional[str] = None) -> Dict[str, float]:
     # A node runs 28 of these. At INFO each one announces itself at startup
     # and the useful output scrolls away, so a supervisor that prints its own
     # aggregate status turns them down to WARNING. Errors and OOM are logged
@@ -280,7 +282,8 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                            stats_path, max_seconds, target_positions,
                            watchdog_seconds, heartbeat_seconds, perf_debug,
                            perf_path, perf_warmup, scale_parallel_to_target,
-                           runtime_config_path, freeze_perf_on_drain)
+                           runtime_config_path, freeze_perf_on_drain,
+                           stop_file, chunk_dir)
     except BaseException as exc:
         if _is_cuda_oom(exc):
             # Not a crash: the card is simply too small for this many workers.
@@ -315,7 +318,8 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
                 perf_path=None, perf_warmup=0.0,
                 scale_parallel_to_target=True,
                 runtime_config_path=None,
-                freeze_perf_on_drain=True) -> Dict[str, float]:
+                freeze_perf_on_drain=True, stop_file=None,
+                chunk_dir=None) -> Dict[str, float]:
     backend = make_backend(network_path, cfg, device, fp16)
     perf = None
     if perf_debug or perf_path:
@@ -333,7 +337,10 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
         search_module.Search.__init__ = patched_init
         perf.search_timing = shared_timing
     generation = backend.network_metadata.get("generation", 0)
-    out_dir = os.path.join(output_dir, f"worker_{worker_id:02d}")
+    # A collector may be watching this directory, so every worker can write
+    # into one spool: the file names already carry the worker id, and each
+    # chunk is renamed into place atomically once it is complete.
+    out_dir = chunk_dir or os.path.join(output_dir, f"worker_{worker_id:02d}")
     os.makedirs(out_dir, exist_ok=True)
 
     parallel = effective_parallel_games(cfg, target_positions,
@@ -359,9 +366,21 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
     def on_game(game) -> None:
         index = state["index"]
         state["index"] = index + 1
-        name = (f"g{generation:06d}_w{worker_id:02d}_"
-                f"{int(time.time() * 1000):013d}_{index:06d}.gz")
-        frames = game.write(os.path.join(out_dir, name))
+        # The generation and the position count are in the name so a
+        # collector can group and size chunks without decompressing them.
+        # Nothing else parses this; the loader and the shard packer only
+        # ever glob for "*.gz".
+        stem = (f"g{generation:06d}_w{worker_id:02d}_"
+                f"{int(time.time() * 1000):013d}_{index:06d}")
+        frames = game.write(os.path.join(out_dir, stem + ".gz"))
+        if chunk_dir and frames:
+            # Rename rather than write under the final name: the collector
+            # must never see a size in the name it cannot trust.
+            final = os.path.join(out_dir, f"{stem}_n{frames:05d}.gz")
+            try:
+                os.replace(os.path.join(out_dir, stem + ".gz"), final)
+            except OSError:
+                pass
         stats.add_game(game.stats)
         if log_every and (index + 1) % log_every == 0:
             result = {WHITE_WON: "1-0", BLACK_WON: "0-1",
@@ -424,6 +443,13 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
 
     def _should_stop() -> bool:
         if num_games > 0 and stats.games >= num_games:
+            return True
+        if stop_file and os.path.exists(stop_file):
+            # A supervisor retiring this worker -- to move it onto a new
+            # network, say. Same meaning as any other stop: admit no more
+            # games, finish the ones in flight. Checked by stat() on a tick
+            # that already runs between search batches, so it costs nothing
+            # measurable next to a forward pass.
             return True
         # Count the plies already played in the games still running: they will
         # become training positions once those games finish.

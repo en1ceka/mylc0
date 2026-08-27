@@ -252,6 +252,45 @@ class NodeStatus:
             f"backlog {backlog_gb:.1f}G | up {uploaded:.0f} | "
             f"fail {failures:.0f}")
 
+    def continuous_line(self, generation: int, network_sha: str,
+                        shard_fill: int = 0, shard_target: int = 0,
+                        outbox_shards: int = 0, outbox_gb: float = 0.0,
+                        uploaded: int = 0, uploaded_positions: int = 0,
+                        failures: int = 0, switching: str = "") -> str:
+        """Status for a node that never stops.
+
+        No shard percentage and no ETA for the process as a whole: a node is
+        an infinite producer, and "43% | ETA 1h" invited exactly the wrong
+        reading. The only progress bar that means anything is the mini-shard
+        currently being filled.
+        """
+        r = self.last or self.sample()
+        rate = ("--" if r["positions_per_min"] != r["positions_per_min"]
+                else f"{r['positions_per_min']:.0f}")
+        gpu = ("?" if r["gpu_util"] != r["gpu_util"]
+               else f"{r['gpu_util']:.0f}%")
+        cpu = ("?" if r["cpu_util"] != r["cpu_util"]
+               else f"{r['cpu_util']:.0f}%")
+        vram = ("" if r["vram_used_mib"] != r["vram_used_mib"]
+                else f" | VRAM {r['vram_used_mib'] / 1024:.1f}G")
+        shard = (f" | shard {_fmt_count(shard_fill)}/"
+                 f"{_fmt_count(shard_target)}" if shard_target else "")
+        return (
+            f"gen {generation} ({network_sha[:8]}) | {rate} pos/min | "
+            f"{_fmt_count(r['nodes_per_s'])} nodes/s | "
+            f"{_fmt_count(r['evals_per_s'])} evals/s | "
+            f"GPU {gpu} | CPU {cpu}{vram} | "
+            f"batch {r['avg_batch']:.0f} p50 {r['p50_batch']:.0f} "
+            f"p95 {r['p95_batch']:.0f} | "
+            f"{r['games_in_flight']:.0f} in flight | "
+            f"finished {r['games_done']:.0f} games / "
+            f"{_fmt_count(r['finalized_positions'])} pos{shard} | "
+            f"outbox {outbox_shards} shards / {outbox_gb:.2f}G | "
+            f"uploaded {uploaded} / {_fmt_count(uploaded_positions)} pos | "
+            f"failed {failures}"
+            f"{' | ' + switching if switching else ''} | "
+            f"{_fmt_duration(r['elapsed_s'])} up")
+
     def summary(self) -> Dict[str, float]:
         """Final performance record for the shard manifest.
 
