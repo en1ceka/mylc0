@@ -17,12 +17,22 @@ Only implementation parameters are swept:
 
 Stages are run in that order, each keeping the winner of the previous one, so
 the cost is linear rather than a full grid.
+
+On a machine whose good region you already know, skip the sweep entirely and
+measure exactly the points you care about:
+
+    python scripts/tune_selfplay.py --configs "w24 g48 b512" "w28 g48 b512" \
+        --final-warmup 30 --final-seconds 300
+
+A configuration that does not fit in VRAM is reported as OOM and the benchmark
+moves on to the next one; it is never treated as a performance result.
 """
 
 import argparse
 import json
 import multiprocessing as mp
 import os
+import re
 import shutil
 import statistics
 import tempfile
@@ -31,33 +41,129 @@ import time
 import _bootstrap  # noqa: F401
 
 from mylc0.net.config import load_config
-from mylc0.perf import (detect_cpu, detect_gpu, diagnose, limit_thread_pools,
-                        runnable_threads, sample_cpu, sample_gpu, usable_cpus)
-from mylc0.selfplay.worker import run_worker
+from mylc0.perf import (detect_cpu, detect_gpu, diagnose, gpu_memory,
+                        gpu_processes, limit_thread_pools, runnable_threads,
+                        sample_cpu, sample_gpu, usable_cpus, wait_for_vram)
+from mylc0.selfplay.worker import OOM_EXIT_CODE, run_worker
 
 
-def _sampler(stop, gpu_samples, cpu_samples, thread_samples, pids,
-             interval=0.5):
+def _sampler(stop, samples, pids, interval=0.5):
+    """Background sampling of everything the driver can tell us."""
     import threading
+
     def loop():
         while not stop.is_set():
             g = sample_gpu()
             if g:
-                gpu_samples.append(g)
+                samples["gpu"].append(g)
             total, _cores = sample_cpu(per_core=False)
             if total is not None:
-                cpu_samples.append(total)
-            thread_samples.append(runnable_threads(pids))
+                samples["cpu"].append(total)
+            samples["threads"].append(runnable_threads(pids))
+            mem = gpu_memory()
+            if mem:
+                samples["vram"].append(mem["used_mib"])
+            procs = gpu_processes()
+            if procs is not None:
+                ours = [p for p in procs if p["pid"] in pids]
+                samples["cuda_procs"].append(len(ours))
+                known = [p["used_mib"] for p in ours if p["used_mib"] is not None]
+                if known:
+                    samples["vram_per_proc"].append(statistics.fmean(known))
+                    samples["vram_ours"].append(sum(known))
             stop.wait(interval)
+
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
     return thread
 
 
+def _new_samples():
+    return {"gpu": [], "cpu": [], "threads": [], "vram": [],
+            "cuda_procs": [], "vram_per_proc": [], "vram_ours": []}
+
+
+def _kill_all(procs, grace=5.0):
+    """Terminate, then kill. Returns the PIDs that refused to die."""
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+    deadline = time.time() + grace
+    for proc in procs:
+        proc.join(max(0.0, deadline - time.time()))
+    survivors = []
+    for proc in procs:
+        if proc.is_alive():
+            try:
+                proc.kill()
+                proc.join(2.0)
+            except Exception:
+                pass
+        if proc.is_alive():
+            survivors.append(proc.pid)
+    return survivors
+
+
+def _await_workers(procs, deadline, settle=4.0):
+    """Wait for the run to end. Returns ("ok"|"oom"|"crash"|"timeout", codes).
+
+    Polls instead of joining so a worker that dies three seconds in aborts the
+    trial immediately rather than after the full measurement window -- with an
+    OOM that is the difference between a five-minute wait and a five-second one.
+
+    When the card runs out, workers do not all fail the same way: one raises a
+    real OOM while its siblings get whatever cuBLAS says when it cannot get a
+    workspace. Whoever exits first would otherwise decide the label, so once
+    any worker fails the rest get ``settle`` seconds to fail too, and a single
+    OOM anywhere outvotes every crash.
+    """
+    def classify(codes):
+        bad = [c for c in codes if c not in (None, 0)]
+        return ("oom" if OOM_EXIT_CODE in bad else "crash") if bad else None
+
+    while True:
+        codes = [p.exitcode for p in procs]
+        if classify(codes) is not None:
+            end = time.time() + settle
+            while time.time() < end:
+                codes = [p.exitcode for p in procs]
+                if all(c is not None for c in codes):
+                    break
+                time.sleep(0.2)
+            codes = [p.exitcode for p in procs]
+            return classify(codes), codes
+        if all(c is not None for c in codes):
+            return "ok", codes
+        if time.time() > deadline:
+            return "timeout", codes
+        time.sleep(0.25)
+
+
+def _read_failures(paths):
+    out = []
+    for path in paths:
+        try:
+            with open(path + ".fail", encoding="utf-8") as handle:
+                out.append(json.load(handle))
+        except (OSError, ValueError):
+            pass
+    return out
+
+
 def run_trial(args, workers, parallel_games, nn_batch, torch_threads,
               affinity, seconds, warmup):
-    """One measured configuration. Returns a dict of metrics."""
+    """One measured configuration. Returns a dict of metrics.
+
+    Never raises for a configuration that does not fit on the card: an OOM
+    comes back as ``{"ok": False, "oom": True}`` so the caller can record it
+    and carry on with the next candidate.
+    """
     import threading
+
+    label = f"w{workers} g{parallel_games} b{nn_batch}"
+    baseline = gpu_memory()
+    base_vram = baseline["used_mib"] if baseline else float("nan")
+    total_vram = baseline["total_mib"] if baseline else float("nan")
 
     workdir = tempfile.mkdtemp(prefix="mylc0-tune-")
     perf_paths = [os.path.join(workdir, f"perf_{i}.json")
@@ -91,21 +197,29 @@ def run_trial(args, workers, parallel_games, nn_batch, torch_threads,
         proc.start()
         procs.append(proc)
 
-    # Sample the measurement window only, never the ramp-up.
-    pids = [p.pid for p in procs]
-    gpu_samples, cpu_samples, thread_samples = [], [], []
+    pids = {p.pid for p in procs}
+    samples = _new_samples()
     stop = threading.Event()
+
+    # Warm-up: not sampled, but still watched. An OOM almost always lands here,
+    # while every worker is allocating its context and weights at once.
+    outcome, codes = "running", []
     deadline = t0 + warmup
-    while (time.perf_counter() < deadline
-           and any(p.is_alive() for p in procs)):
-        time.sleep(0.2)
-    _sampler(stop, gpu_samples, cpu_samples, thread_samples, pids)
+    while time.perf_counter() < deadline:
+        outcome, codes = _await_workers(procs, time.time() + 0.25)
+        if outcome != "timeout":
+            break                      # died, or all finished early
+        outcome = "running"
 
-    for proc in procs:
-        proc.join()
-    elapsed = time.perf_counter() - t0
+    if outcome == "running":
+        _sampler(stop, samples, pids)
+        # The drain after max_seconds can take a while: a worker finishes the
+        # search it is in before it stops.
+        outcome, codes = _await_workers(procs, time.time() + seconds + 180.0)
     stop.set()
+    elapsed = time.perf_counter() - t0
 
+    failures = _read_failures(perf_paths)
     per_worker = []
     for path in perf_paths:
         try:
@@ -113,13 +227,38 @@ def run_trial(args, workers, parallel_games, nn_batch, torch_threads,
                 per_worker.append(json.load(f))
         except (OSError, ValueError):
             pass
-    failed = [p.exitcode for p in procs if p.exitcode]
+
+    survivors = _kill_all(procs)
     shutil.rmtree(workdir, ignore_errors=True)
 
+    vram = _vram_summary(samples, base_vram, total_vram, workers)
+    cleanup = _verify_cleanup(base_vram, survivors, pids, args.vram_settle)
+    common_out = {"workers": workers, "parallel_games": parallel_games,
+                  "nn_batch": nn_batch, "torch_threads": torch_threads,
+                  "affinity": affinity, "label": label,
+                  "exit_codes": [(-1 if c is None else c) for c in codes], "cleanup": cleanup}
+
+    if outcome == "crash" and any(f.get("error") == "cuda_oom"
+                                  for f in failures):
+        outcome = "oom"          # a worker said so in writing
+
+    if outcome in ("oom", "crash", "timeout"):
+        reason = {"oom": "CUDA out of memory",
+                  "crash": f"worker crashed (exit codes {codes})",
+                  "timeout": "workers did not finish in time"}[outcome]
+        detail = ""
+        for fail in failures:
+            first = (fail.get("detail") or "").splitlines()
+            if first:
+                detail = first[0]
+                break
+        return {"ok": False, "oom": outcome == "oom", "reason": reason,
+                "detail": detail, **common_out, **vram}
+
     if not per_worker:
-        return {"ok": False, "reason": f"no telemetry (exit codes {failed})",
-                "workers": workers, "parallel_games": parallel_games,
-                "nn_batch": nn_batch}
+        return {"ok": False, "oom": False,
+                "reason": f"no telemetry (exit codes {codes})",
+                **common_out, **vram}
 
     def total(key):
         return sum(w.get(key, 0.0) for w in per_worker)
@@ -129,6 +268,7 @@ def run_trial(args, workers, parallel_games, nn_batch, torch_threads,
         return statistics.fmean(values) if values else 0.0
 
     wall = max(w.get("wall_s", elapsed) for w in per_worker)
+    gpu_samples = samples["gpu"]
     gpu_util = (statistics.fmean(s["utilization.gpu"] for s in gpu_samples)
                 if gpu_samples else float("nan"))
     # With one process the CUDA events measure GPU busy time directly.
@@ -141,16 +281,11 @@ def run_trial(args, workers, parallel_games, nn_batch, torch_threads,
         gpu_busy_pct = min(100.0, 100.0 * forward / max(wall, 1e-9))
     else:
         gpu_busy_pct = gpu_util
-    vram = (max(s["memory.used"] for s in gpu_samples) / 1024
-            if gpu_samples else float("nan"))
     power = (statistics.fmean(s["power.draw"] for s in gpu_samples)
              if gpu_samples else float("nan"))
 
     return {
-        "ok": True,
-        "workers": workers, "parallel_games": parallel_games,
-        "nn_batch": nn_batch, "torch_threads": torch_threads,
-        "affinity": affinity,
+        "ok": True, "oom": False,
         "positions_per_min": total("plies") / max(wall, 1e-9) * 60,
         "nodes_per_s": total("nodes_per_s"),
         "evals_per_s": total("evals_per_s"),
@@ -164,13 +299,61 @@ def run_trial(args, workers, parallel_games, nn_batch, torch_threads,
         "cpu_busy_pct": mean("cpu_busy_pct"),
         "gather_pct": mean("gather_pct"), "encode_pct": mean("encode_pct"),
         "terminal_pct": mean("terminal_pct"), "apply_pct": mean("apply_pct"),
-        "gpu_util": gpu_util, "vram_gb": vram, "power_w": power,
-        "cpu_total": statistics.fmean(cpu_samples) if cpu_samples else float("nan"),
-        "threads": max(thread_samples) if thread_samples else 0,
+        "gpu_util": gpu_util, "power_w": power,
+        "cpu_total": (statistics.fmean(samples["cpu"])
+                      if samples["cpu"] else float("nan")),
+        "threads": max(samples["threads"]) if samples["threads"] else 0,
         "games": total("games"), "positions": total("positions"),
         "plies": total("plies"), "wall_s": wall,
+        **common_out, **vram,
         "per_worker": per_worker,
     }
+
+
+def _vram_summary(samples, base_vram, total_vram, workers):
+    """VRAM telemetry for one trial, in MiB."""
+    used = samples["vram"]
+    peak = max(used) if used else float("nan")
+    ours = samples["vram_ours"]
+    per_proc = samples["vram_per_proc"]
+    return {
+        "vram_total_mib": total_vram,
+        "vram_baseline_mib": base_vram,
+        "vram_peak_mib": peak,
+        "vram_mean_mib": statistics.fmean(used) if used else float("nan"),
+        "vram_peak_pct": (100.0 * peak / total_vram if total_vram else
+                          float("nan")),
+        # What the trial's own processes hold, when the driver breaks it down.
+        # Windows/WDDM reports [N/A] per process, so these stay NaN there and
+        # the global peak above is the number to read.
+        "vram_workers_peak_mib": max(ours) if ours else float("nan"),
+        "vram_per_worker_mib": max(per_proc) if per_proc else float("nan"),
+        "cuda_procs": max(samples["cuda_procs"]) if samples["cuda_procs"] else 0,
+        "cuda_procs_expected": workers,
+    }
+
+
+def _verify_cleanup(base_vram, survivors, pids, settle_seconds):
+    """Confirm the trial left nothing behind before the next one starts."""
+    ok_vram, used, waited = wait_for_vram(base_vram, tolerance_mib=256.0,
+                                          timeout=settle_seconds)
+    leaked = []
+    procs = gpu_processes()
+    if procs is not None:
+        leaked = [p["pid"] for p in procs if p["pid"] in pids]
+    problems = []
+    if survivors:
+        problems.append(f"{len(survivors)} worker process(es) would not die: "
+                        f"{survivors}")
+    if leaked:
+        problems.append(f"CUDA context still held by pid(s) {leaked}")
+    if not ok_vram:
+        problems.append(f"VRAM stuck at {used:.0f} MiB after "
+                        f"{settle_seconds:.0f}s "
+                        f"(baseline {base_vram:.0f} MiB)")
+    return {"clean": not problems, "problems": problems,
+            "vram_after_mib": used, "settle_s": waited,
+            "orphans": survivors, "cuda_leaks": leaked}
 
 
 def _dump_config(source, target, parallel_games, nn_batch):
@@ -187,6 +370,48 @@ def _dump_config(source, target, parallel_games, nn_batch):
         out.append(line)
     with open(target, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
+
+
+_SPEC = re.compile(r"^w(\d+)\s+g(\d+)\s+b(\d+)(\s+aff)?$", re.I)
+
+
+def parse_config_spec(text):
+    """Parse "w24 g48 b512" (optionally "... aff") into a candidate dict.
+
+    The direct mode exists because a screening sweep starts from small
+    defaults, and on a big machine those are a waste of ten minutes: you
+    already know roughly where the good region is and want exactly those
+    points measured properly.
+    """
+    match = _SPEC.match(text.strip())
+    if not match:
+        raise ValueError(
+            f"cannot parse configuration {text!r}; expected "
+            f"\"w<workers> g<parallel_games> b<nn_batch>\" with an optional "
+            f"trailing \"aff\", e.g. \"w24 g48 b512\"")
+    workers, games, batch, aff = match.groups()
+    return {"workers": int(workers), "parallel_games": int(games),
+            "nn_batch": int(batch), "affinity": bool(aff),
+            "positions_per_min": float("nan"), "ok": True, "direct": True}
+
+
+def parse_config_specs(items):
+    """``--configs`` takes either repeated values or one comma separated one."""
+    out = []
+    for item in items:
+        for part in item.split(","):
+            part = part.strip()
+            if part:
+                out.append(parse_config_spec(part))
+    return out
+
+
+def vram_note(result):
+    """Short VRAM string for a table cell."""
+    peak = result.get("vram_peak_mib")
+    if _missing(peak):
+        return "     -"
+    return f"{peak / 1024:.1f}G"
 
 
 def config_key(result):
@@ -240,31 +465,86 @@ def choose_winner(results, tolerance=0.03):
 
 def final_table(results, winner):
     lines = []
-    head = (f"  {'configuration':<26} {'pos/min':>8} {'nodes/s':>8} "
+    head = (f"  {'configuration':<20} {'pos/min':>8} {'nodes/s':>8} "
             f"{'evals/s':>8} {'GPU':>5} {'CPU':>5} {'avg':>5} {'p50':>5} "
-            f"{'p95':>5} {'starv':>6} {'waitGPU':>8}")
+            f"{'p95':>5} {'starv':>6} {'waitGPU':>8} {'VRAMpk':>7}")
     lines.append(head)
     lines.append("  " + "-" * (len(head) - 2))
     for r in results:
+        label = r.get("label") or (
+            f"w{r.get('workers')} g{r.get('parallel_games')} "
+            f"b{r.get('nn_batch')}")
+        if r.get("affinity"):
+            label += " aff"
         if not r.get("ok"):
-            lines.append(f"  {'(failed)':<26} {r.get('reason', '')}")
+            tag = "OOM" if r.get("oom") else "FAILED"
+            lines.append(f"  {label:<20} {tag:>8}   {r.get('reason', '')}"
+                         f"   (VRAM peak {vram_note(r).strip()})")
             continue
-        label = (f"w{r['workers']} g{r['parallel_games']} b{r['nn_batch']}"
-                 + (" aff" if r["affinity"] else ""))
         mark = " <-- winner" if r is winner else ""
         lines.append(
-            f"  {label:<26} {r['positions_per_min']:>8.0f} "
+            f"  {label:<20} {r['positions_per_min']:>8.0f} "
             f"{r['nodes_per_s']:>8.0f} {r['evals_per_s']:>8.0f} "
             f"{r['gpu_util']:>4.0f}% {r['cpu_total']:>4.0f}% "
             f"{r['avg_batch']:>5.0f} {r['p50_batch']:>5.0f} "
             f"{r['p95_batch']:>5.0f} {r['gpu_starvation_pct']:>5.0f}% "
-            f"{r['cpu_wait_gpu_pct']:>7.0f}%{mark}")
+            f"{r['cpu_wait_gpu_pct']:>7.0f}% {vram_note(r):>7}{mark}")
     return "\n".join(lines)
+
+
+def vram_block(result):
+    """Per-trial VRAM detail, printed under each finished trial."""
+    if _missing(result.get("vram_peak_mib")):
+        return "    VRAM: nvidia-smi unavailable"
+    total = result.get("vram_total_mib", float("nan"))
+    line = (f"    VRAM: baseline {result['vram_baseline_mib']:.0f} MiB"
+            f" -> mean {result['vram_mean_mib']:.0f}"
+            f" / peak {result['vram_peak_mib']:.0f} MiB")
+    if not _missing(total):
+        line += f" ({result['vram_peak_pct']:.0f}% of {total / 1024:.0f} GB)"
+    per = result.get("vram_per_worker_mib")
+    if not _missing(per):
+        line += (f"\n          per worker {per:.0f} MiB"
+                 f" x {result.get('cuda_procs', 0)} CUDA process(es)")
+    else:
+        line += (f"\n          {result.get('cuda_procs', 0)}"
+                 f"/{result.get('cuda_procs_expected', 0)} CUDA context(s)"
+                 f"; per-process VRAM not reported by this driver")
+    return line
+
+
+def vram_alerts(result):
+    """Warnings that concern memory rather than speed."""
+    out = []
+    pct = result.get("vram_peak_pct")
+    if not _missing(pct) and pct > 90.0:
+        out.append(f"WARNING: VRAM PEAK {pct:.0f}% OF THE CARD\n"
+                   f"  peak {result['vram_peak_mib']:.0f} MiB of "
+                   f"{result['vram_total_mib']:.0f} MiB.\n"
+                   f"  This configuration is one allocation away from an OOM; "
+                   f"a longer run or a\n"
+                   f"  deeper-searching network can still tip it over.")
+    seen = result.get("cuda_procs", 0)
+    want = result.get("cuda_procs_expected", 0)
+    if want and seen and seen > want:
+        out.append(f"WARNING: {seen} CUDA CONTEXTS FOR {want} WORKERS\n"
+                   f"  Something outside this trial is holding the GPU, so its "
+                   f"VRAM figures\n  include memory the benchmark did not "
+                   f"allocate.")
+    return out
+
+
+def _missing(value):
+    """NaN-safe "did we get a reading" test."""
+    return value is None or value != value
 
 
 def show(result, label=""):
     if not result.get("ok"):
-        print(f"  {label:<28s} FAILED: {result.get('reason')}")
+        tag = "OUT OF VRAM" if result.get("oom") else "FAILED"
+        print(f"  {label:<28s} {tag}: {result.get('reason')}")
+        if result.get("detail"):
+            print(f"  {'':<28s} {result['detail']}")
         return
     print(f"  {label:<28s} {result['positions_per_min']:>7.0f} pos/min "
           f"| {result['evals_per_s']:>7.0f} evals/s "
@@ -300,6 +580,15 @@ def main() -> int:
     parser.add_argument("--tolerance", type=float, default=0.03,
                         help="within this margin, prefer the simpler "
                              "configuration")
+    parser.add_argument("--configs", nargs="+", default=None, metavar="SPEC",
+                        help="benchmark exactly these configurations and "
+                             "nothing else, e.g. --configs \"w24 g48 b512\" "
+                             "\"w28 g48 b512\". Skips the whole sweep.")
+    parser.add_argument("--slim-json", action="store_true",
+                        help="omit the per-worker telemetry")
+    parser.add_argument("--vram-settle", type=float, default=45.0,
+                        help="seconds to wait for VRAM to return to baseline "
+                             "between trials before calling it a leak")
     args = parser.parse_args()
 
     limit_thread_pools(1)
@@ -330,6 +619,15 @@ def main() -> int:
 
     results = []
     vram_gb = gpu.get("vram_gb") or 8
+
+    if args.configs:
+        try:
+            explicit = parse_config_specs(args.configs)
+        except ValueError as exc:
+            print(f"\n{exc}")
+            return 1
+        print(f"direct mode: {len(explicit)} configuration(s), no sweep")
+        return run_finals(args, [], gpu, cpu, cpus, explicit=explicit)
 
     if args.final_from:
         with open(args.final_from, encoding="utf-8") as handle:
@@ -401,24 +699,31 @@ def main() -> int:
     return run_finals(args, results, gpu, cpu, cpus)
 
 
-def run_finals(args, results, gpu, cpu, cpus):
-    """Confirm the best screened configurations on a long, quiet window."""
-    finalists = pick_finalists(results, args.final_top)
+def run_finals(args, results, gpu, cpu, cpus, explicit=None):
+    """Measure a handful of configurations on a long, quiet window.
+
+    ``explicit`` is the direct mode: the exact list to run, in order, instead
+    of whatever a screening sweep happened to like.
+    """
+    finalists = explicit if explicit is not None else pick_finalists(
+        results, args.final_top)
     if not finalists:
         print("nothing to confirm")
         return 1
 
     print("\n" + "=" * 78)
-    print(f"final benchmark: top {len(finalists)} configuration(s), "
+    print(f"final benchmark: {len(finalists)} configuration(s), "
           f"{args.final_warmup:.0f}s warm-up + {args.final_seconds:.0f}s "
           f"measured each")
     print("=" * 78)
     for r in finalists:
+        screened = ("" if explicit is not None else
+                    f"   (screened at {r['positions_per_min']:.0f} pos/min)")
         print(f"  candidate  w{r['workers']} g{r['parallel_games']} "
-              f"b{r['nn_batch']}{' aff' if r['affinity'] else ''}"
-              f"   (screened at {r['positions_per_min']:.0f} pos/min)")
+              f"b{r['nn_batch']}{' aff' if r['affinity'] else ''}{screened}")
 
     finals = []
+    aborted = False
     for candidate in finalists:
         label = (f"w{candidate['workers']} g{candidate['parallel_games']} "
                  f"b{candidate['nn_batch']}"
@@ -429,16 +734,54 @@ def run_finals(args, results, gpu, cpu, cpus):
                       args.final_seconds, args.final_warmup)
         finals.append(r)
         show(r, label)
+        print(vram_block(r))
+        for alert in vram_alerts(r):
+            print("  " + alert.replace("\n", "\n  "))
+
+        cleanup = r.get("cleanup") or {}
+        if not cleanup.get("clean", True):
+            # Refuse to keep going: a leaked context would be charged to the
+            # next trial and could turn a configuration that fits into a
+            # spurious OOM, which is worse than stopping with fewer results.
+            print("\n  ERROR: the GPU was not left clean after this trial")
+            for problem in cleanup.get("problems", []):
+                print(f"    - {problem}")
+            print("  Refusing to start the next trial; its numbers would "
+                  "include these leftovers.")
+            aborted = True
+            break
+        if cleanup.get("settle_s", 0) > 1.0:
+            print(f"    cleanup: VRAM back to "
+                  f"{cleanup['vram_after_mib']:.0f} MiB after "
+                  f"{cleanup['settle_s']:.1f}s")
 
     winner, contenders = choose_winner(finals, args.tolerance)
     if winner is None:
-        print("every final run failed")
+        print("\n" + "=" * 78)
+        print("FINAL BENCHMARK")
+        print("=" * 78)
+        print(final_table(finals, None))
+        oom = [r for r in finals if r.get("oom")]
+        if oom and len(oom) == len(finals):
+            print("\n  Every configuration ran out of VRAM. Lower --configs "
+                  "workers, or the\n  nn_batch, and try again.")
+        else:
+            print("\n  No configuration produced a usable measurement.")
+        _write_results(args, gpu, cpu, cpus, results, finals, None)
         return 1
 
     print("\n" + "=" * 78)
     print("FINAL BENCHMARK")
     print("=" * 78)
     print(final_table(finals, winner))
+
+    skipped = [r for r in finals if not r.get("ok")]
+    if skipped:
+        print()
+        for r in skipped:
+            what = "ran out of VRAM" if r.get("oom") else "failed"
+            print(f"  {r.get('label', '?')} {what} and is not a candidate; "
+                  f"the remaining {len(finals) - len(skipped)} were compared.")
 
     fastest = max((r for r in finals if r.get("ok")),
                   key=lambda r: r["positions_per_min"])
@@ -467,7 +810,10 @@ def run_finals(args, results, gpu, cpu, cpus):
     print(f"  avg/p50/p95 batch{winner['avg_batch']:>5.0f} /"
           f"{winner['p50_batch']:>4.0f} /{winner['p95_batch']:>4.0f}")
     print(f"  GPU util         {winner['gpu_util']:.0f}%   "
-          f"VRAM {winner['vram_gb']:.1f} GB   {winner['power_w']:.0f} W")
+          f"{winner['power_w']:.0f} W")
+    print(f"  VRAM peak        {winner['vram_peak_mib']:.0f} MiB "
+          f"({winner['vram_peak_pct']:.0f}% of the card), mean "
+          f"{winner['vram_mean_mib']:.0f} MiB")
     print(f"  CPU util         {winner['cpu_total']:.0f}%")
     print(f"  GPU starvation   {winner['gpu_starvation_pct']:.0f}%")
     print(f"  CPU wait for GPU {winner['cpu_wait_gpu_pct']:.0f}%")
@@ -492,13 +838,22 @@ def run_finals(args, results, gpu, cpu, cpus):
     print(f"and run: python scripts/loop.py --workers {winner['workers']}"
           + ("  (with CPU affinity)" if winner["affinity"] else ""))
 
-    if args.json:
-        with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({"gpu": gpu, "cpu": cpu, "usable_cpus": cpus,
-                       "results": results, "finals": finals,
-                       "winner": winner}, f, indent=1)
-        print(f"\nall trials written to {args.json}")
-    return 0
+    _write_results(args, gpu, cpu, cpus, results, finals, winner)
+    return 1 if aborted else 0
+
+
+def _write_results(args, gpu, cpu, cpus, results, finals, winner):
+    """Persist everything, OOM trials included -- they are a result too."""
+    if not args.json:
+        return
+    payload = {"gpu": gpu, "cpu": cpu, "usable_cpus": cpus,
+               "results": results, "finals": finals, "winner": winner}
+    if args.slim_json:
+        for trial in finals:
+            trial.pop("per_worker", None)
+    with open(args.json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=1, default=str)
+    print(f"\nall trials written to {args.json}")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from __future__ import annotations
 import faulthandler
 import json
 import logging
+import multiprocessing
 import os
 import sys
 import time
@@ -27,7 +28,8 @@ from ..chessrules.position import BLACK_WON, DRAW, UNDECIDED, WHITE_WON
 from ..net.backend import Backend
 from ..net.config import Config, SelfPlayConfig, load_config
 from ..net.netfile import load_network
-from ..perf import (PerfCounters, affinity_slice, set_affinity, write_json)
+from ..perf import (PerfCounters, affinity_slice, gpu_memory, set_affinity,
+                    write_json)
 from .batched import BatchedSelfPlay
 
 log = logging.getLogger("mylc0.selfplay")
@@ -92,6 +94,86 @@ def make_backend(network_path: str, cfg: SelfPlayConfig, device: str,
     return backend
 
 
+OOM_EXIT_CODE = 42
+"""Exit code a worker uses to say "I ran out of VRAM", as opposed to crashing.
+
+The tuner has to tell the two apart: an OOM means the configuration is too
+large for the card and the next one should still be tried, while a crash means
+the benchmark itself is broken and hiding it would be wrong.
+"""
+
+
+def _release_cuda() -> None:
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass                     # a dead context cannot be synchronised
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+# Wordings that mean "the allocation failed" and nothing else.
+_OOM_CERTAIN = (
+    "out of memory",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
+)
+# Wordings a genuinely exhausted card also produces. Measured on a 3060 Ti
+# with 32 workers: exactly one process raised torch.OutOfMemoryError while the
+# rest reported these instead -- cuBLAS cannot allocate its workspace and calls
+# that a failed execution, and a context that cannot be created at all is
+# reported as a busy device. Treating them as crashes would abort a benchmark
+# that is merely too ambitious, so they are resolved by asking the driver how
+# much VRAM is actually left.
+_OOM_LIKELY = (
+    "cublas_status_execution_failed",
+    "cublas_status_not_initialized",
+    "cudnn_status_not_initialized",
+    "device(s) is/are busy or unavailable",
+    "no kernel image is available",
+)
+
+
+def _vram_exhausted(floor_mib: float = 512.0) -> bool:
+    """Ask nvidia-smi, not torch: after a CUDA error the context is unusable.
+
+    Racy by nature -- sibling workers may already be dying and handing memory
+    back -- so it only ever promotes an already-suspicious CUDA error, and is
+    never the sole reason to call something an OOM.
+    """
+    mem = gpu_memory()
+    if mem is None:
+        return False
+    return mem["free_mib"] <= floor_mib
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    text = str(exc).lower()
+    if any(hint in text for hint in _OOM_CERTAIN):
+        return True
+    if any(hint in text for hint in _OOM_LIKELY):
+        return _vram_exhausted()
+    return False
+
+
+def _write_failure(path: Optional[str], kind: str, detail: str) -> None:
+    """Leave a breadcrumb the parent can read after the process is gone."""
+    if not path:
+        return
+    try:
+        with open(path + ".fail", "w", encoding="utf-8") as handle:
+            json.dump({"error": kind, "detail": detail[:4000],
+                       "pid": os.getpid()}, handle)
+    except OSError:
+        pass
+
+
 def run_worker(config_path: str, network_path: str, output_dir: str,
                worker_id: int = 0, num_games: int = 0, seed: int = 0,
                device: Optional[str] = None, fp16: Optional[bool] = None,
@@ -135,14 +217,31 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                            stats_path, max_seconds, target_positions,
                            watchdog_seconds, heartbeat_seconds, perf_debug,
                            perf_path, perf_warmup)
-    except BaseException:
+    except BaseException as exc:
+        if _is_cuda_oom(exc):
+            # Not a crash: the card is simply too small for this many workers.
+            # Report it as its own exit code so the tuner can mark the trial
+            # OOM and move on instead of aborting the whole benchmark.
+            log.error("worker %d: CUDA out of memory (%s)", worker_id,
+                      str(exc).splitlines()[0])
+            _write_failure(perf_path or stats_path, "cuda_oom", str(exc))
+            _release_cuda()
+            if multiprocessing.parent_process() is not None:
+                sys.exit(OOM_EXIT_CODE)
+            raise
         # Never swallow a worker failure: log it here (the parent only sees an
         # exit code) and re-raise so the exit code is non-zero.
         log.exception("worker %d died", worker_id)
+        _write_failure(perf_path or stats_path, "crash", repr(exc))
         raise
     finally:
         torch.set_grad_enabled(prev_grad)
         torch.set_num_threads(prev_threads)
+        if multiprocessing.parent_process() is not None:
+            # A child is about to exit; drop the allocator's cache now so the
+            # parent sees VRAM return to baseline promptly rather than waiting
+            # on the driver to reap the context.
+            _release_cuda()
 
 
 def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,

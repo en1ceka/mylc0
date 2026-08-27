@@ -175,6 +175,77 @@ def sample_gpu() -> Optional[Dict[str, float]]:
         return None
 
 
+def gpu_memory():
+    """Total / used / free VRAM in MiB, or None without nvidia-smi."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        total, used, free = [float(x) for x in
+                             out.stdout.strip().splitlines()[0].split(",")]
+        return {"total_mib": total, "used_mib": used, "free_mib": free}
+    except Exception:
+        return None
+
+
+def gpu_processes():
+    """Per-process VRAM: list of {"pid", "used_mib"}, newest driver first.
+
+    ``used_mib`` is None where the driver refuses to break the number down --
+    notably every consumer GPU on Windows, which runs in WDDM mode and hands
+    memory management to the OS, so nvidia-smi reports ``[N/A]`` per process.
+    The process list itself is still accurate there, which is what the CUDA
+    context leak check actually needs.
+    """
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    procs = []
+    for line in out.stdout.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        try:
+            used = float(parts[1])
+        except ValueError:
+            used = None          # "[N/A]" under WDDM
+        procs.append({"pid": int(parts[0]), "used_mib": used})
+    return procs
+
+
+def wait_for_vram(baseline_mib: float, tolerance_mib: float = 256.0,
+                  timeout: float = 30.0, poll: float = 0.5):
+    """Block until VRAM falls back to ``baseline_mib`` (+ tolerance).
+
+    Returns ``(ok, used_mib, waited_s)``. A process that died still holds its
+    CUDA context until the driver reaps it, which takes a moment; starting the
+    next trial before that finishes would charge the leftovers to it and can
+    push a borderline configuration into a spurious OOM.
+    """
+    deadline = time.time() + timeout
+    used = float("nan")
+    start = time.time()
+    while True:
+        mem = gpu_memory()
+        if mem is None:
+            return True, float("nan"), 0.0
+        used = mem["used_mib"]
+        if used <= baseline_mib + tolerance_mib:
+            return True, used, time.time() - start
+        if time.time() >= deadline:
+            return False, used, time.time() - start
+        time.sleep(poll)
+
+
 def sample_cpu(per_core: bool = True):
     if not psutil:
         return None, None
