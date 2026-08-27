@@ -5,3 +5,7 @@ chess>=1.10         # rules only: move generation, FEN, Chess960 castling
 PyYAML>=6.0
 tensorboard>=2.13   # optional, for monitoring
 onnx>=1.15          # optional, only for scripts/export_network.py --onnx
+
+# Cloudflare R2 transport (self-play farm -> object storage -> local trainer).
+boto3>=1.34         # S3-compatible client; R2 needs nothing beyond it
+zstandard>=0.22     # shard compression
