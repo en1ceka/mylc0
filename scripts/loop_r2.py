@@ -181,9 +181,10 @@ def main() -> int:
     parser.add_argument("--data", default="data")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--replay-generations", type=int, default=3)
-    parser.add_argument("--min-new-positions", type=int, default=0,
+    parser.add_argument("--min-new-positions", type=int, default=500_000,
                         help="new positions required before a generation is "
-                             "trained (default: training.positions_per_network)")
+                             "trained. Pass 0 to fall back to "
+                             "training.positions_per_network from the config.")
     parser.add_argument("--steps", type=int, default=None,
                         help="override training.steps_per_network")
     parser.add_argument("--generations", type=int, default=0,
@@ -210,6 +211,10 @@ def main() -> int:
     _install_signal_handlers()
 
     config = load_config(args.config)
+    # A shard is hundreds of thousands of positions, so a gate of a few tens
+    # of thousands would fire on almost every sync and train generation after
+    # generation on a replay window that had barely moved. Half a million new
+    # positions is roughly one full shard from a 4090-class node.
     threshold = (args.min_new_positions
                  or config.training.positions_per_network)
     policy = policy_from_config(args.replay_generations)
@@ -219,7 +224,8 @@ def main() -> int:
     print(f"  config           {args.config}")
     print(f"  data             {os.path.abspath(args.data)}")
     print(f"  replay window    {policy.describe()}")
-    print(f"  train when       {threshold} new positions have arrived")
+    print(f"  train when       {threshold:,} new positions have arrived"
+          .replace(",", " "))
     print(f"  steps/generation {args.steps or config.training.steps_per_network}"
           f" at batch {config.training.batch_size}")
     print(f"  publish          {'no (local only)' if args.no_publish else 'yes'}")
