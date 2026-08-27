@@ -52,7 +52,46 @@ from .storage import StorageError
 log = logging.getLogger("mylc0.cloud.collect")
 
 # g000036_w00_1787663329920_000000_n00112.gz
-CHUNK_RE = re.compile(r"^g(\d{6})_w(\d+)_(\d+)_(\d+)(?:_n(\d+))?\.gz$")
+#  |      |   |             |      +-- positions, and only ever from here
+#  |      |   |             +-- per-worker game index
+#  |      |   +-- milliseconds since the epoch
+#  |      +-- worker id, one or more digits
+#  +-- generation
+#
+# Named groups rather than positions: every field here is a run of digits, so
+# a numbered group is one edit away from silently meaning something else --
+# reading the worker id as a position count, say, which is the kind of mistake
+# that shows up as a plausible-looking small number rather than as an error.
+CHUNK_RE = re.compile(
+    r"^g(?P<generation>\d{6})"
+    r"_w(?P<worker>\d+)"
+    r"_(?P<timestamp>\d+)"
+    r"_(?P<index>\d+)"
+    r"(?:_n(?P<positions>\d+))?"
+    r"\.gz$")
+
+
+def parse_chunk_name(name: str):
+    """Fields of a chunk file name, or None if it is not one.
+
+    Never guesses. A name that does not match exactly is rejected, because a
+    file the collector cannot size would otherwise be packed as if it held
+    zero positions and quietly skew every shard it landed in.
+    """
+    match = CHUNK_RE.match(name)
+    if not match:
+        return None
+    positions = match.group("positions")
+    return {
+        "generation": int(match.group("generation")),
+        "worker": int(match.group("worker")),
+        "timestamp": int(match.group("timestamp")),
+        "index": int(match.group("index")),
+        # Only the trailing _nNNNNN carries the count. An older chunk written
+        # before the suffix existed reports 0 rather than borrowing a number
+        # from another field.
+        "positions": int(positions) if positions is not None else 0,
+    }
 
 
 @dataclass
@@ -85,8 +124,7 @@ def scan_spool(spool_dir: str) -> List[Chunk]:
     except OSError:
         return out
     for name in names:
-        match = CHUNK_RE.match(name)
-        if not match:
+        if CHUNK_RE.match(name) is None:
             continue
         path = os.path.join(spool_dir, name)
         try:
@@ -96,9 +134,9 @@ def scan_spool(spool_dir: str) -> List[Chunk]:
             continue
         if size <= 0:
             continue
-        positions = int(match.group(5) or 0)
-        out.append(Chunk(path=path, generation=int(match.group(1)),
-                         positions=positions, mtime=mtime))
+        fields = parse_chunk_name(name)
+        out.append(Chunk(path=path, generation=fields["generation"],
+                         positions=fields["positions"], mtime=mtime))
     out.sort(key=lambda c: (c.mtime, c.path))
     return out
 
@@ -293,4 +331,5 @@ class ShardCollector:
 
 
 __all__ = ["ShardCollector", "CollectorStats", "Chunk", "scan_spool",
+           "parse_chunk_name",
            "group_by_generation", "select_for_shard", "CHUNK_RE"]

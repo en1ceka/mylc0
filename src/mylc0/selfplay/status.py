@@ -160,6 +160,12 @@ class NodeStatus:
             "live_plies": live_plies,
             "finalized_positions": finalized,
             "games_done": total("games"),
+            # The first games to finish are by definition the shortest ones,
+            # so early in a run this is far below the eventual average. Shown
+            # because "3 games / 26 pos" otherwise reads as a broken counter
+            # rather than as three very short games.
+            "avg_game_plies": (finalized / total("games")
+                               if total("games") else 0.0),
             "games_in_flight": total("games_in_flight"),
             "positions_per_min": rate_per_min,
             "avg_positions_per_min": average_per_min,
@@ -284,7 +290,8 @@ class NodeStatus:
             f"p95 {r['p95_batch']:.0f} | "
             f"{r['games_in_flight']:.0f} in flight | "
             f"finished {r['games_done']:.0f} games / "
-            f"{_fmt_count(r['finalized_positions'])} pos{shard} | "
+            f"{_fmt_count(r['finalized_positions'])} pos "
+            f"(avg {r['avg_game_plies']:.0f} plies){shard} | "
             f"outbox {outbox_shards} shards / {outbox_gb:.2f}G | "
             f"uploaded {uploaded} / {_fmt_count(uploaded_positions)} pos | "
             f"failed {failures}"

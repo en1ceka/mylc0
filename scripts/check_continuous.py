@@ -24,7 +24,8 @@ import traceback
 
 import _bootstrap  # noqa: F401
 
-from mylc0.cloud.collector import CHUNK_RE, ShardCollector, scan_spool
+from mylc0.cloud.collector import (CHUNK_RE, ShardCollector,
+                                   parse_chunk_name, scan_spool)
 from mylc0.cloud.index import ShardIndex
 from mylc0.cloud.layout import manifest_key
 from mylc0.cloud.shards import parse_manifest, unpack_shard
@@ -188,6 +189,97 @@ def check_worker_keeps_going(tmp):
     assert sum(1 for s in early if s == 4) > len(early) * 0.5, \
         f"slots sat below capacity: {early[:20]}"
     return f"{len(finished)} games, slots stayed at {max(early)}/4"
+
+
+@check("the position count comes only from the trailing _nNNNNN")
+def check_parser_fields():
+    """The failure this guards against reads as a plausible small number.
+
+    Every field in a chunk name is a run of digits, so a parser that takes the
+    wrong one reports, say, the worker id as a position count -- 7 instead of
+    112 -- which looks like a slow node rather than like a bug.
+    """
+    cases = [
+        # name, generation, worker, timestamp, index, positions
+        ("g000036_w07_1787663329920_000000_n00112.gz",
+         36, 7, 1787663329920, 0, 112),
+        ("g000036_w09_1787663331004_000001_n00150.gz",
+         36, 9, 1787663331004, 1, 150),
+        # Multi-digit worker: 28 workers means ids up to 27.
+        ("g000036_w27_1787663340117_000042_n00098.gz",
+         36, 27, 1787663340117, 42, 98),
+        ("g000036_w127_1787663340117_123456_n01234.gz",
+         36, 127, 1787663340117, 123456, 1234),
+        # A genuinely tiny game, so a small count is not assumed to be a bug.
+        ("g000037_w00_1787663999999_000000_n00007.gz",
+         37, 0, 1787663999999, 0, 7),
+        # Position count larger than any other field.
+        ("g000999_w01_0000000000001_000002_n99999.gz",
+         999, 1, 1, 2, 99999),
+    ]
+    for name, gen, worker, stamp, index, positions in cases:
+        fields = parse_chunk_name(name)
+        assert fields is not None, f"rejected a valid name: {name}"
+        assert fields["positions"] == positions, (name, fields)
+        assert fields["worker"] == worker, (name, fields)
+        assert fields["generation"] == gen, (name, fields)
+        assert fields["timestamp"] == stamp, (name, fields)
+        assert fields["index"] == index, (name, fields)
+        # The specific confusion: the worker id must never be the count.
+        if worker != positions:
+            assert fields["positions"] != worker, (name, fields)
+
+    # w07 with n00112 is the exact case from the report.
+    assert parse_chunk_name(
+        "g000036_w07_1787663329920_000000_n00112.gz")["positions"] == 112
+    return f"{len(cases)} names; w07 -> 112, w09 -> 150, w27 -> 98"
+
+
+@check("a name that is not a chunk is rejected, never guessed")
+def check_parser_rejects():
+    bad = [
+        "g000036_w07_1787663329920_000000_n00112.gz.tmp",   # mid-write
+        "g00036_w07_1787663329920_000000_n00112.gz",        # short generation
+        "g000036_w_1787663329920_000000_n00112.gz",         # no worker id
+        "g000036_w07_1787663329920_n00112.gz",              # no index
+        "g000036_w07_1787663329920_000000_n.gz",            # empty count
+        "g000036_w07_1787663329920_000000_x00112.gz",       # wrong marker
+        "gABCDEF_w07_1787663329920_000000_n00112.gz",       # not digits
+        "shard_000001.tar.zst",
+        "junk.gz",
+        "",
+    ]
+    for name in bad:
+        assert parse_chunk_name(name) is None, f"accepted {name!r}"
+        assert CHUNK_RE.match(name) is None, f"regex accepted {name!r}"
+
+    # A chunk written before the suffix existed reports zero rather than
+    # borrowing a number from another field.
+    old = parse_chunk_name("g000036_w07_1787663329920_000000.gz")
+    assert old is not None and old["positions"] == 0, old
+    assert old["worker"] == 7, old
+    return f"{len(bad)} malformed names rejected; a legacy name reports 0"
+
+
+@check("shard sizing and the heartbeat read the same parser")
+def check_one_parser(tmp):
+    collector, spool, outbox = make_collector(tmp, "oneparser", target=300)
+    # Worker ids that would be obvious if they leaked into a count.
+    for worker, positions in ((7, 112), (9, 150), (27, 98)):
+        finish_game(spool, worker=worker, positions=positions)
+
+    # What the heartbeat prints as "shard X/20k".
+    assert collector.pending_positions() == 360, collector.pending_positions()
+    assert collector.pending()[36]["chunks"] == 3
+
+    # What the shard is actually sized and manifested by.
+    assert collector.build_ready() == 1
+    manifest = outbox.pending()[0]
+    assert manifest.positions == 360, manifest.positions
+    assert manifest.games == 3, manifest.games
+    # 7 + 9 + 27 = 43, which is what a worker-id bug would have produced.
+    assert manifest.positions != 43
+    return "spool fill and manifest both 360, not 43"
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +628,11 @@ def main() -> int:
         check_game_is_durable(tmp)
         check_partial_game_invisible(tmp)
         check_worker_keeps_going(tmp)
+
+        print("\n== chunk name parser ==")
+        check_parser_fields()
+        check_parser_rejects()
+        check_one_parser(tmp)
 
         print("\n== mini-shards ==")
         check_minishard_closes(tmp)
