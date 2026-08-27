@@ -20,6 +20,8 @@ behaviour rather than paying for weighted sampling nobody asked for.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -88,6 +90,32 @@ class WeightedReplayWindow(ReplayWindow):
         return f"weighted window ({parts})"
 
 
+def generation_dirs(roots, policy: "ReplayWindow"):
+    """The ``gen_NNNNNN`` directories the policy currently admits.
+
+    Returns ``(paths, generations)``. The directories on disk are the source
+    of truth rather than the index, so this keeps working if the index is
+    rebuilt or the data was put there by hand.
+
+    Recomputed per generation by the callers: the window moves as new data
+    lands, and a loader built once at startup would keep reading the same
+    three directories while newer ones piled up beside it.
+    """
+    found = {}
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            match = re.fullmatch(r"gen_(\d{6})", name)
+            path = os.path.join(root, name)
+            if match and os.path.isdir(path):
+                found.setdefault(int(match.group(1)), []).append(path)
+    if not found:
+        return [], []
+    chosen, _weights = policy.select(sorted(found))
+    return [p for gen in chosen for p in found[gen]], chosen
+
+
 def policy_from_config(generations: int = 3,
                        weights: Optional[Dict[int, float]] = None
                        ) -> ReplayWindow:
@@ -97,4 +125,5 @@ def policy_from_config(generations: int = 3,
     return ReplayWindow(generations=generations)
 
 
-__all__ = ["ReplayWindow", "WeightedReplayWindow", "policy_from_config"]
+__all__ = ["ReplayWindow", "WeightedReplayWindow", "policy_from_config",
+           "generation_dirs"]

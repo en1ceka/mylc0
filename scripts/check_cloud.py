@@ -774,6 +774,93 @@ def check_sync_ignores_incomplete(tmp):
 
 
 # ---------------------------------------------------------------------------
+# the local loop's gate
+# ---------------------------------------------------------------------------
+def _loop_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "loop_r2", os.path.join(os.path.dirname(__file__), "loop_r2.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@check("the training watermark survives a restart")
+def check_watermark_persistence(tmp):
+    loop = _loop_module()
+    path = os.path.join(tmp, "wm", "watermark.json")
+    fresh = loop.Watermark(path)
+    assert fresh.value == 0, fresh.value
+    fresh.set(64000)
+
+    # A restart must not retrain on data it already used, nor wait again for
+    # a threshold it has already passed.
+    reopened = loop.Watermark(path)
+    assert reopened.value == 64000, reopened.value
+
+    # A corrupt or truncated file falls back to zero rather than crashing the
+    # loop; the worst case is one generation trained on familiar data.
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("{ not json")
+    assert loop.Watermark(path).value == 0
+    return "persisted, and tolerant of a damaged file"
+
+
+@check("the loop trains only once enough new positions have arrived")
+def check_training_gate(tmp):
+    loop = _loop_module()
+    outbox = Outbox(os.path.join(tmp, "outbox-gate"))
+    index = ShardIndex(os.path.join(tmp, "gate.db"))
+    watermark = loop.Watermark(os.path.join(tmp, "gate-wm.json"))
+    threshold = 20000
+
+    def new_positions():
+        return index.total_positions() - watermark.value
+
+    # Below the threshold nothing may happen, however many shards arrived.
+    for seq in range(3):
+        manifest = stage_shard(tmp, outbox, "node-g", 36, seq, chunks=2)
+        manifest.positions = 5000
+        index.record(manifest, "d", 0.0)
+    assert new_positions() == 15000, new_positions()
+    assert new_positions() < threshold, "would have trained too early"
+
+    # Crossing it releases exactly one generation.
+    manifest = stage_shard(tmp, outbox, "node-g", 36, 9, chunks=2)
+    manifest.positions = 6000
+    index.record(manifest, "d", 0.0)
+    assert new_positions() == 21000 >= threshold
+
+    total_at_training = index.total_positions()
+    watermark.set(total_at_training)
+    assert new_positions() == 0, "the gate did not close after training"
+
+    # Data that lands while training still counts as new afterwards, because
+    # the watermark is the count taken when training started.
+    late = stage_shard(tmp, outbox, "node-g", 37, 10, chunks=2)
+    late.positions = 20000
+    index.record(late, "d", 0.0)
+    assert new_positions() == 20000 >= threshold, new_positions()
+
+    text = loop.status(index, [36, 37], watermark, threshold)
+    assert "20000/20000" in text, text
+    index.close()
+    return "held at 15000, released at 21000, closed after, reopened at 20000"
+
+
+@check("the status line survives an empty window and a zero threshold")
+def check_status_edges(tmp):
+    loop = _loop_module()
+    index = ShardIndex(os.path.join(tmp, "edges.db"))
+    watermark = loop.Watermark(os.path.join(tmp, "edges-wm.json"))
+    text = loop.status(index, [], watermark, 20000)
+    assert "empty" in text, text
+    assert loop.status(index, [], watermark, 0), "divided by a zero threshold"
+    index.close()
+    return "no data and no threshold both render"
+
+
+# ---------------------------------------------------------------------------
 # retry primitive
 # ---------------------------------------------------------------------------
 @check("retry backs off exponentially and gives up after the last attempt")
@@ -889,6 +976,11 @@ def main() -> int:
         print("\n== end to end ==")
         check_sync_end_to_end(tmp)
         check_sync_ignores_incomplete(tmp)
+
+        print("\n== local loop gate ==")
+        check_watermark_persistence(tmp)
+        check_training_gate(tmp)
+        check_status_edges(tmp)
 
         print("\n== failure handling ==")
         check_interrupted_download(tmp)
