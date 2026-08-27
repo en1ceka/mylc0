@@ -31,6 +31,7 @@ import multiprocessing as mp
 import os
 import shutil
 import signal
+import threading
 import sys
 import time
 
@@ -38,11 +39,12 @@ import _bootstrap  # noqa: F401
 
 from mylc0.cloud.layout import (make_shard_id, load_or_create_node_id,
                                 shard_key, today)
-from mylc0.cloud.models import LatestPointer, ensure_model, fetch_latest
+from mylc0.cloud.models import ensure_model, fetch_latest
 from mylc0.cloud.shards import build_manifest, collect_chunks, pack_shard
 from mylc0.cloud.storage import (StorageError, describe_env,
                                  store_from_env)
 from mylc0.cloud.uploader import Backpressure, Outbox, ShardUploader
+from mylc0.selfplay.status import NodeStatus, confirmation_line
 from mylc0.net.config import load_config
 from mylc0.perf import limit_thread_pools
 from mylc0.selfplay.worker import run_worker
@@ -103,6 +105,31 @@ def _dump_config(source: str, target: str, parallel_games: int,
         out.append(line)
     with open(target, "w", encoding="utf-8") as handle:
         handle.write("\n".join(out) + "\n")
+
+def _heartbeat(status, stop, interval, context):
+    """One aggregated line per interval, in its own thread.
+
+    Reading 28 files and asking nvidia-smi for a sample is not something a
+    worker should be interrupted for, and it must not delay the join either,
+    so it runs beside the wait rather than inside it.
+    """
+    # Take a reading straight away so the rate has a baseline to measure
+    # against and the first printed line already means something.
+    status.sample()
+    while not stop.wait(interval):
+        try:
+            status.sample()
+            info = context() if context else {}
+            log.info("%s", status.line(
+                generation=info.get("generation", 0),
+                network_sha=info.get("network_sha", ""),
+                shard_index=info.get("shard_index", 0),
+                backlog_gb=info.get("backlog_gb", 0.0),
+                uploaded=info.get("uploaded", 0),
+                failures=info.get("failures", 0)))
+        except Exception as exc:                       # noqa: BLE001
+            log.debug("status line failed: %s", exc)   # never fatal
+
 
 class ConfigMismatch(RuntimeError):
     """A worker started with knobs the node did not ask for."""
@@ -170,7 +197,8 @@ def overshoot_floor(workers, parallel_games, max_game_ply):
 
 
 def generate_shard(args, config_path: str, network_path: str,
-                   staging_dir: str, target_positions: int, expected: dict):
+                   staging_dir: str, target_positions: int, expected: dict,
+                   context=None):
     """Run one round of self-play into ``staging_dir``. Returns totals.
 
     Raises ConfigMismatch if the workers did not start with ``expected``.
@@ -186,6 +214,8 @@ def generate_shard(args, config_path: str, network_path: str,
                    for i in range(workers)]
     runtime_paths = [os.path.join(stats_dir, f"runtime_{i}.json")
                      for i in range(workers)]
+    perf_paths = [os.path.join(stats_dir, f"perf_{i}.json")
+                  for i in range(workers)]
 
     ctx = mp.get_context("spawn")
     procs = []
@@ -199,6 +229,11 @@ def generate_shard(args, config_path: str, network_path: str,
             target_positions=per_worker, log_every=0,
             stats_path=stats_paths[i],
             runtime_config_path=runtime_paths[i],
+            # The workers' own counters are the telemetry: each publishes a
+            # snapshot from the tick it already runs, and the parent reads the
+            # files. No queue, so nothing here can ever block self-play.
+            perf_debug=True, perf_path=perf_paths[i],
+            log_level=args.worker_log_level,
             # A shard boundary is not a quota: whatever the games in flight
             # produce past it goes into the shard. Scaling parallel_games
             # down to fit the target -- which is right for loop.py's exact
@@ -221,13 +256,21 @@ def generate_shard(args, config_path: str, network_path: str,
         for proc in procs:
             proc.join(5.0)
         raise
-    first = observed[min(observed)]
-    log.info("workers confirmed: %d games in flight, NN batch %d, fp16=%s, "
-             "visits=%d", first["parallel_games"], first["nn_batch"],
-             first["fp16"], first["visits"])
+    log.info("%s", confirmation_line(workers, observed[min(observed)]))
 
-    for proc in procs:
-        proc.join()
+    status = NodeStatus(perf_paths, target_positions=target_positions,
+                        rate_window=max(30.0, args.status_seconds * 2))
+    stop_beat = threading.Event()
+    beat = threading.Thread(target=_heartbeat, daemon=True,
+                            args=(status, stop_beat, args.status_seconds,
+                                  context))
+    beat.start()
+    try:
+        for proc in procs:
+            proc.join()
+    finally:
+        stop_beat.set()
+        beat.join(timeout=3.0)
     elapsed = time.perf_counter() - started
 
     totals = {"games": 0, "positions": 0, "plies": 0, "seconds": elapsed,
@@ -241,6 +284,9 @@ def generate_shard(args, config_path: str, network_path: str,
         totals["games"] += int(payload.get("games", 0))
         totals["positions"] += int(payload.get("positions", 0))
         totals["plies"] += int(payload.get("plies", 0))
+    # A final performance record travels with the shard, so nodes in a farm
+    # stay comparable long after any of them has stopped running.
+    totals["performance"] = status.summary()
     shutil.rmtree(stats_dir, ignore_errors=True)
     return totals
 
@@ -264,21 +310,6 @@ def resolve_model(store, cache_dir: str, args, current):
                         attempts=args.retry_attempts,
                         base_delay=args.retry_backoff)
     return pointer, path
-
-
-def status_line(node_id, pointer: LatestPointer, shard_index, totals,
-                backpressure, uploader) -> str:
-    rate = (totals["positions"] / totals["seconds"] * 60
-            if totals["seconds"] else 0.0)
-    stats = uploader.stats
-    return (f"[{node_id}] gen {pointer.generation} "
-            f"(net {pointer.sha256[:8]}) | shard #{shard_index} "
-            f"{totals['games']} games / {totals['positions']} pos "
-            f"| {rate:.0f} pos/min "
-            f"| backlog {backpressure.backlog_gb:.2f} GB "
-            f"| sent {stats.uploaded} shards {stats.bytes_sent / 1e6:.0f} MB "
-            f"at {stats.mb_per_s:.1f} MB/s "
-            f"| failed {stats.failed}")
 
 
 def main() -> int:
@@ -317,11 +348,21 @@ def main() -> int:
     parser.add_argument("--poll-latest-seconds", type=float, default=0.0,
                         help="extra latest.json poll while draining a backlog "
                              "(0 = only between shards)")
-    parser.add_argument("--status-seconds", type=float, default=60.0)
+    parser.add_argument("--status-seconds", type=float, default=15.0,
+                        help="seconds between node status lines")
+    parser.add_argument("--worker-log-level", default="WARNING",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="per-worker log level. The default hides 28 "
+                             "startup banners; errors and OOM are logged "
+                             "above it and stay visible.")
+    parser.add_argument("--verbose-workers", action="store_true",
+                        help="shorthand for --worker-log-level INFO")
     parser.add_argument("--dry-run", action="store_true",
                         help="check config and R2 access, then exit")
     args = parser.parse_args()
 
+    if args.verbose_workers:
+        args.worker_log_level = "INFO"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [node] %(levelname)s %(message)s")
@@ -402,7 +443,6 @@ def main() -> int:
                              keep_local=args.keep_local_shards)
     backpressure = Backpressure(outbox, args.max_backlog_gb)
     sequence = 0
-    last_status = 0.0
 
     # Anything left from a previous life goes out before new work is made.
     leftovers = outbox.pending()
@@ -436,9 +476,16 @@ def main() -> int:
             target_positions = args.shard_games * max(
                 1, effective.selfplay.max_game_ply // 2)
 
+        def context(_gen=generation, _sha=pointer.sha256, _n=sequence):
+            stats = uploader.stats
+            return {"generation": _gen, "network_sha": _sha,
+                    "shard_index": _n, "backlog_gb": backpressure.backlog_gb,
+                    "uploaded": stats.uploaded, "failures": stats.failed}
+
         try:
             totals = generate_shard(args, run_config, network_path, staging,
-                                    target_positions, expected_runtime)
+                                    target_positions, expected_runtime,
+                                    context)
         except ConfigMismatch as exc:
             log.error("%s", exc)
             log.error("Refusing to generate slow data. This is a "
@@ -467,7 +514,11 @@ def main() -> int:
             visits=effective.selfplay.visits,
             extra={"plies": totals["plies"],
                    "seconds": round(totals["seconds"], 1),
-                   "model_key": pointer.key})
+                   "model_key": pointer.key,
+                   "workers": args.workers,
+                   "parallel_games": effective.selfplay.parallel_games,
+                   "nn_batch": effective.selfplay.batch_size,
+                   "performance": totals.get("performance", {})})
         # The manifest lands next to the data before any upload is attempted,
         # so a node killed here still has a complete, self-describing shard.
         with open(outbox.manifest_path_for(shard_id), "wb") as handle:
@@ -480,11 +531,14 @@ def main() -> int:
 
         uploader.drain(should_continue=lambda: True)
 
-        now = time.time()
-        if now - last_status >= args.status_seconds:
-            last_status = now
-            log.info("%s", status_line(node_id, pointer, sequence, totals,
-                                       backpressure, uploader))
+        perf = totals.get("performance", {})
+        log.info("shard %s done: %d games, %d positions, %.0f pos/min avg, "
+                 "GPU %.0f%%, CPU %.0f%%, batch %.0f, %s",
+                 shard_id, totals["games"], totals["positions"],
+                 perf.get("avg_positions_per_min", 0.0),
+                 perf.get("gpu_util_avg", 0.0), perf.get("cpu_util_avg", 0.0),
+                 perf.get("avg_batch", 0.0),
+                 f"{perf.get('elapsed_s', 0.0):.0f}s")
 
         # Only now, between shards, may the network change.
         try:

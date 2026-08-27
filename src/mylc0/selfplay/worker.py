@@ -242,9 +242,14 @@ def run_worker(config_path: str, network_path: str, output_dir: str,
                torch_threads: int = 1, affinity: bool = False,
                workers_total: int = 1,
                scale_parallel_to_target: bool = True,
-               runtime_config_path: Optional[str] = None) -> Dict[str, float]:
+               runtime_config_path: Optional[str] = None,
+               log_level: str = "INFO") -> Dict[str, float]:
+    # A node runs 28 of these. At INFO each one announces itself at startup
+    # and the useful output scrolls away, so a supervisor that prints its own
+    # aggregate status turns them down to WARNING. Errors and OOM are logged
+    # above that level and stay visible either way.
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, str(log_level).upper(), logging.INFO),
         format=f"%(asctime)s [selfplay-{worker_id}] %(message)s")
     config: Config = load_config(config_path)
     cfg = config.selfplay
@@ -377,6 +382,7 @@ def _play_games(config, cfg, network_path, output_dir, worker_id, num_games,
         perf.games = stats.games
         perf.positions = stats.positions
         perf.plies = stats.plies + driver.plies_in_flight()
+        perf.games_in_flight = driver.active_games()
         perf.nodes = stats.nodes + driver.nodes_in_flight()
         perf.batch_sizes = driver.batch_history
         snapshot = perf.snapshot()

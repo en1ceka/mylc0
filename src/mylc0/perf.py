@@ -314,6 +314,8 @@ class PerfCounters:
     _base: Dict[str, float] = field(default_factory=dict)
     _base_batches: int = 0
 
+    games_in_flight: int = 0
+
     def rebaseline(self) -> None:
         """Start a fresh measurement window at the current totals."""
         self._base = {
@@ -387,6 +389,15 @@ class PerfCounters:
             "games": self._since("games"), "positions": self._since("positions"),
             "plies": self._since("plies"), "evals": self._since("evals"),
             "cache_hits": self._since("cache_hits"),
+            # Explicit names for two very different counts. ``live_plies``
+            # includes games still being played, so throughput is measurable
+            # seconds after start instead of only once games finish;
+            # ``finalized_positions`` counts what finished games actually
+            # wrote, and is what ends up in a shard. Reporting the first as
+            # the second would overstate the dataset by everything in flight.
+            "live_plies": self._since("plies"),
+            "finalized_positions": self._since("positions"),
+            "games_in_flight": self.games_in_flight,
         }
 
 
